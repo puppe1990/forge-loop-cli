@@ -380,6 +380,8 @@ pub fn read_progress(runtime_dir: &Path) -> ProgressSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn dual_gate_requires_exit_signal_true() {
@@ -395,5 +397,43 @@ mod tests {
         let analysis = analyze_output("STATUS: COMPLETE\nEXIT_SIGNAL: true", "", &indicators);
         assert_eq!(analysis.completion_indicators, 1);
         assert!(analysis.exit_signal_true);
+    }
+
+    #[test]
+    fn build_exec_args_includes_plan_prompt_when_present() {
+        let dir = tempdir().expect("tempdir");
+        let forge_dir = dir.path().join(".forge");
+        fs::create_dir_all(&forge_dir).expect("create .forge");
+        fs::write(forge_dir.join("plan.md"), "Refactor architecture in phases")
+            .expect("write plan");
+
+        let args = build_exec_args(&ResumeMode::New, dir.path());
+
+        assert!(args.contains(&"exec".to_string()));
+        assert!(args.contains(&"--json".to_string()));
+        assert_eq!(
+            args.last().expect("last arg"),
+            "Refactor architecture in phases"
+        );
+    }
+
+    #[test]
+    fn build_exec_args_ignores_empty_plan_file() {
+        let dir = tempdir().expect("tempdir");
+        let forge_dir = dir.path().join(".forge");
+        fs::create_dir_all(&forge_dir).expect("create .forge");
+        fs::write(forge_dir.join("plan.md"), "   \n").expect("write empty plan");
+
+        let args = build_exec_args(&ResumeMode::Last, dir.path());
+
+        assert_eq!(
+            args,
+            vec![
+                "exec".to_string(),
+                "resume".to_string(),
+                "--last".to_string(),
+                "--json".to_string(),
+            ]
+        );
     }
 }
