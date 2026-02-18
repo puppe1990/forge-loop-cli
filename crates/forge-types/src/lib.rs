@@ -9,6 +9,7 @@ pub enum CircuitState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CircuitBreakerState {
     pub state: CircuitState,
     pub consecutive_no_progress: u32,
@@ -24,6 +25,7 @@ impl Default for CircuitBreakerState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RunStatus {
     pub state: String,
     pub current_loop: u64,
@@ -33,6 +35,8 @@ pub struct RunStatus {
     pub exit_signal_seen: bool,
     pub session_id: Option<String>,
     pub circuit_state: CircuitState,
+    pub current_loop_started_at_epoch: u64,
+    pub last_heartbeat_at_epoch: u64,
     pub updated_at_epoch: u64,
 }
 
@@ -47,12 +51,15 @@ impl Default for RunStatus {
             exit_signal_seen: false,
             session_id: None,
             circuit_state: CircuitState::Closed,
+            current_loop_started_at_epoch: 0,
+            last_heartbeat_at_epoch: 0,
             updated_at_epoch: 0,
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct ProgressSnapshot {
     pub loops_with_progress: u64,
     pub loops_without_progress: u64,

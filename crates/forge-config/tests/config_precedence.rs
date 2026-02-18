@@ -18,6 +18,7 @@ fn cli_overrides_file_values() {
                 "--sandbox".to_string(),
                 "danger-full-access".to_string(),
             ]),
+            codex_exec_args: None,
             max_calls_per_hour: Some(77),
             timeout_minutes: Some(22),
             resume: None,

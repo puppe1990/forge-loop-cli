@@ -7,7 +7,9 @@ use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -27,6 +29,8 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     Run(RunCommand),
+    Analyze(AnalyzeCommand),
+    Doctor(DoctorCommand),
     Status(StatusCommand),
     Monitor(MonitorCommand),
     Sdd(SddCommand),
@@ -42,6 +46,9 @@ struct RunCommand {
 
     #[arg(long, conflicts_with = "resume")]
     resume_last: bool,
+
+    #[arg(long, conflicts_with_all = ["resume", "resume_last"])]
+    fresh: bool,
 
     #[arg(long)]
     max_calls_per_hour: Option<u32>,
@@ -63,9 +70,42 @@ struct StatusCommand {
 }
 
 #[derive(Debug, clap::Args)]
+struct AnalyzeCommand {
+    #[arg(long = "codex-arg")]
+    codex_pre_args: Vec<String>,
+
+    #[arg(long, default_value_t = true)]
+    modified_only: bool,
+
+    #[arg(long, default_value_t = 25)]
+    chunk_size: usize,
+
+    #[arg(long)]
+    resume_latest_report: bool,
+
+    #[arg(long)]
+    timeout_minutes: Option<u64>,
+
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, clap::Args)]
 struct MonitorCommand {
     #[arg(long, default_value_t = 500)]
     refresh_ms: u64,
+}
+
+#[derive(Debug, clap::Args)]
+struct DoctorCommand {
+    #[arg(long)]
+    json: bool,
+
+    #[arg(long)]
+    fix: bool,
+
+    #[arg(long)]
+    strict: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -111,6 +151,8 @@ fn main() -> Result<()> {
 
     match cli.command {
         Some(Commands::Run(cmd)) => run_command(cmd, cwd),
+        Some(Commands::Analyze(cmd)) => analyze_command(cmd, cwd),
+        Some(Commands::Doctor(cmd)) => doctor_command(cmd, cwd),
         Some(Commands::Status(cmd)) => status_command(cmd, cwd),
         Some(Commands::Monitor(cmd)) => monitor_command(cmd, cwd),
         Some(Commands::Sdd(cmd)) => sdd_command(cmd, cwd),
@@ -140,6 +182,7 @@ fn assistant_mode(cwd: PathBuf) -> Result<()> {
             codex_pre_args: Vec::new(),
             resume: None,
             resume_last: false,
+            fresh: false,
             max_calls_per_hour: None,
             timeout_minutes: None,
             json: false,
@@ -418,14 +461,26 @@ fn render_plan(a: &SddInterview) -> String {
 }
 
 fn run_command(cmd: RunCommand, cwd: PathBuf) -> Result<()> {
+    if cmd.fresh {
+        cleanup_runtime_state(&cwd)?;
+    }
+
+    let codex_pre_args = cmd.codex_pre_args;
+    let codex_exec_args = if cmd.fresh {
+        Some(vec!["--ephemeral".to_string()])
+    } else {
+        None
+    };
+
     let cfg = load_run_config(
         &cwd,
         &CliOverrides {
-            codex_pre_args: if cmd.codex_pre_args.is_empty() {
+            codex_pre_args: if codex_pre_args.is_empty() {
                 None
             } else {
-                Some(cmd.codex_pre_args)
+                Some(codex_pre_args)
             },
+            codex_exec_args,
             max_calls_per_hour: cmd.max_calls_per_hour,
             timeout_minutes: cmd.timeout_minutes,
             resume: cmd.resume,
@@ -463,6 +518,475 @@ fn run_command(cmd: RunCommand, cwd: PathBuf) -> Result<()> {
     });
 }
 
+fn analyze_command(cmd: AnalyzeCommand, cwd: PathBuf) -> Result<()> {
+    let codex_pre_args_override = if cmd.codex_pre_args.is_empty() {
+        None
+    } else {
+        Some(cmd.codex_pre_args.clone())
+    };
+
+    let cfg = load_run_config(
+        &cwd,
+        &CliOverrides {
+            codex_pre_args: codex_pre_args_override,
+            codex_exec_args: Some(vec!["--ephemeral".to_string()]),
+            max_calls_per_hour: None,
+            timeout_minutes: cmd.timeout_minutes,
+            resume: None,
+            resume_last: false,
+        },
+    )?;
+
+    if cmd.resume_latest_report {
+        return analyze_resume_latest(cmd, cwd, cfg);
+    }
+
+    let files = if cmd.modified_only {
+        list_modified_files(&cwd)?
+    } else {
+        Vec::new()
+    };
+    if cmd.modified_only && files.is_empty() {
+        if cmd.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "modified_files": 0,
+                    "report": "No modified files found.",
+                    "exit_signal": true
+                }))?
+            );
+        } else {
+            println!("No modified files found.\nEXIT_SIGNAL: true");
+        }
+        return Ok(());
+    }
+
+    let chunk_size = cmd.chunk_size.max(1);
+    let chunks = files
+        .chunks(chunk_size)
+        .map(|slice| slice.to_vec())
+        .collect::<Vec<_>>();
+
+    let mut chunk_reports = Vec::new();
+    let mut timed_out_chunks = 0_u64;
+    let mut failed_chunks = 0_u64;
+    for (idx, chunk) in chunks.iter().enumerate() {
+        eprintln!(
+            "analyze: chunk {}/{} ({} files) started",
+            idx + 1,
+            chunks.len(),
+            chunk.len()
+        );
+        let prompt = build_analyze_prompt(chunk, &format!("chunk {}/{}", idx + 1, chunks.len()));
+        let run = run_codex_exec_with_timeout(
+            &cfg.codex_cmd,
+            &cfg.codex_pre_args,
+            &cfg.codex_exec_args,
+            &cwd,
+            &prompt,
+            cfg.timeout_minutes,
+        )?;
+        if run.timed_out {
+            timed_out_chunks += 1;
+        }
+        if run.exit_code != Some(0) {
+            failed_chunks += 1;
+        }
+        eprintln!(
+            "analyze: chunk {}/{} done (exit_code={:?}, timed_out={})",
+            idx + 1,
+            chunks.len(),
+            run.exit_code,
+            run.timed_out
+        );
+        let label = format!(
+            "## Chunk {}/{} ({} files)",
+            idx + 1,
+            chunks.len(),
+            chunk.len()
+        );
+        chunk_reports.push(format!("{label}\n{}", run.report));
+    }
+
+    let report = if chunk_reports.len() <= 1 {
+        chunk_reports
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "No analysis output.".to_string())
+    } else {
+        let joined = chunk_reports.join("\n\n");
+        eprintln!("analyze: synthesis started");
+        let synthesis_prompt = format!(
+            "Consolidate the following chunk analyses into exactly:\n1) Critical risks\n2) High risks\n3) Medium risks\n4) Suggested next actions\nEnd with: EXIT_SIGNAL: true\n\n{joined}"
+        );
+        let synthesis = run_codex_exec_with_timeout(
+            &cfg.codex_cmd,
+            &cfg.codex_pre_args,
+            &cfg.codex_exec_args,
+            &cwd,
+            &synthesis_prompt,
+            cfg.timeout_minutes,
+        )?;
+        eprintln!(
+            "analyze: synthesis done (exit_code={:?}, timed_out={})",
+            synthesis.exit_code, synthesis.timed_out
+        );
+        if synthesis.timed_out || synthesis.exit_code != Some(0) {
+            format!(
+                "Consolidation fallback (timed_out={}, exit_code={:?}).\n\n{}",
+                synthesis.timed_out, synthesis.exit_code, joined
+            )
+        } else {
+            synthesis.report
+        }
+    };
+
+    let persisted = persist_analyze_report(
+        &cwd,
+        &files,
+        chunks.len(),
+        chunk_size,
+        timed_out_chunks,
+        failed_chunks,
+        &chunk_reports,
+        &report,
+    )?;
+
+    if cmd.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "modified_files": files.len(),
+                "chunks": chunks.len(),
+                "chunk_size": chunk_size,
+                "timed_out_chunks": timed_out_chunks,
+                "failed_chunks": failed_chunks,
+                "latest_report_path": persisted.latest_path,
+                "history_report_path": persisted.history_path,
+                "report": report,
+            }))?
+        );
+    } else {
+        println!("latest_report_path: {}", persisted.latest_path);
+        println!("history_report_path: {}", persisted.history_path);
+        println!("{}", report);
+    }
+
+    if timed_out_chunks > 0 {
+        bail!("analyze timed out in {} chunk(s)", timed_out_chunks);
+    }
+    if failed_chunks > 0 {
+        bail!("analyze failed in {} chunk(s)", failed_chunks);
+    }
+    Ok(())
+}
+
+fn analyze_resume_latest(
+    cmd: AnalyzeCommand,
+    cwd: PathBuf,
+    cfg: forge_config::RunConfig,
+) -> Result<()> {
+    let latest = load_latest_analyze_payload(&cwd)?;
+    let files = latest
+        .get("files")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(ToString::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let chunk_reports = latest
+        .get("chunk_reports")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(ToString::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if chunk_reports.is_empty() {
+        bail!("no chunk_reports found in .forge/analyze/latest.json");
+    }
+
+    eprintln!(
+        "analyze: resume from latest report ({} chunk reports)",
+        chunk_reports.len()
+    );
+
+    let joined = chunk_reports.join("\n\n");
+    let synthesis_prompt = format!(
+        "Consolidate the following chunk analyses into exactly:\n1) Critical risks\n2) High risks\n3) Medium risks\n4) Suggested next actions\nEnd with: EXIT_SIGNAL: true\n\n{joined}"
+    );
+    let synthesis = run_codex_exec_with_timeout(
+        &cfg.codex_cmd,
+        &cfg.codex_pre_args,
+        &cfg.codex_exec_args,
+        &cwd,
+        &synthesis_prompt,
+        cfg.timeout_minutes,
+    )?;
+
+    let report = if synthesis.timed_out || synthesis.exit_code != Some(0) {
+        format!(
+            "Consolidation fallback (timed_out={}, exit_code={:?}).\n\n{}",
+            synthesis.timed_out, synthesis.exit_code, joined
+        )
+    } else {
+        synthesis.report
+    };
+
+    let persisted = persist_analyze_report(
+        &cwd,
+        &files,
+        chunk_reports.len(),
+        latest
+            .get("chunk_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize,
+        if synthesis.timed_out { 1 } else { 0 },
+        if synthesis.exit_code == Some(0) { 0 } else { 1 },
+        &chunk_reports,
+        &report,
+    )?;
+
+    if cmd.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mode": "resume_latest_report",
+                "chunk_reports": chunk_reports.len(),
+                "latest_report_path": persisted.latest_path,
+                "history_report_path": persisted.history_path,
+                "report": report,
+                "timed_out": synthesis.timed_out,
+                "exit_code": synthesis.exit_code,
+            }))?
+        );
+    } else {
+        println!("latest_report_path: {}", persisted.latest_path);
+        println!("history_report_path: {}", persisted.history_path);
+        println!("{}", report);
+    }
+
+    if synthesis.timed_out {
+        bail!("resume synthesis timed out");
+    }
+    if synthesis.exit_code != Some(0) {
+        bail!(
+            "resume synthesis failed with exit code {:?}",
+            synthesis.exit_code
+        );
+    }
+    Ok(())
+}
+
+fn list_modified_files(cwd: &Path) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .args(["diff", "--name-only"])
+        .current_dir(cwd)
+        .output()
+        .context("failed to list modified files with git")?;
+    if !output.status.success() {
+        bail!(
+            "git diff failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let files = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    Ok(files)
+}
+
+fn build_analyze_prompt(files: &[String], scope_label: &str) -> String {
+    let mut out = String::from(
+        "Analyze ONLY these modified files and report exactly:\n1) Critical risks\n2) High risks\n3) Medium risks\n4) Suggested next actions\nDo not propose edits, only analysis.\nEnd with: EXIT_SIGNAL: true\n\nScope: ",
+    );
+    out.push_str(scope_label);
+    out.push_str("\n\nModified files:\n");
+    for file in files {
+        out.push_str("- ");
+        out.push_str(file);
+        out.push('\n');
+    }
+    out
+}
+
+fn load_latest_analyze_payload(cwd: &Path) -> Result<serde_json::Value> {
+    let path = cwd.join(".forge").join("analyze").join("latest.json");
+    if !path.exists() {
+        bail!("latest analyze report not found at {}", path.display());
+    }
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid json in {}", path.display()))?;
+    Ok(value)
+}
+
+#[derive(Debug)]
+struct CodexExecRun {
+    report: String,
+    exit_code: Option<i32>,
+    timed_out: bool,
+}
+
+#[derive(Debug)]
+struct AnalyzePersistPaths {
+    latest_path: String,
+    history_path: String,
+}
+
+fn persist_analyze_report(
+    cwd: &Path,
+    files: &[String],
+    chunks: usize,
+    chunk_size: usize,
+    timed_out_chunks: u64,
+    failed_chunks: u64,
+    chunk_reports: &[String],
+    report: &str,
+) -> Result<AnalyzePersistPaths> {
+    let analyze_dir = cwd.join(".forge").join("analyze");
+    let history_dir = analyze_dir.join("history");
+    fs::create_dir_all(&history_dir)
+        .with_context(|| format!("failed to create {}", history_dir.display()))?;
+
+    let now = epoch_now();
+    let payload = serde_json::json!({
+        "created_at_epoch": now,
+        "modified_files": files.len(),
+        "chunks": chunks,
+        "chunk_size": chunk_size,
+        "timed_out_chunks": timed_out_chunks,
+        "failed_chunks": failed_chunks,
+        "files": files,
+        "chunk_reports": chunk_reports,
+        "report": report,
+    });
+
+    let latest_path = analyze_dir.join("latest.json");
+    fs::write(&latest_path, serde_json::to_string_pretty(&payload)?)
+        .with_context(|| format!("failed to write {}", latest_path.display()))?;
+
+    let history_path = history_dir.join(format!("{}.json", now));
+    fs::write(&history_path, serde_json::to_string_pretty(&payload)?)
+        .with_context(|| format!("failed to write {}", history_path.display()))?;
+
+    Ok(AnalyzePersistPaths {
+        latest_path: latest_path.display().to_string(),
+        history_path: history_path.display().to_string(),
+    })
+}
+
+fn run_codex_exec_with_timeout(
+    codex_cmd: &str,
+    codex_pre_args: &[String],
+    codex_exec_args: &[String],
+    cwd: &Path,
+    prompt: &str,
+    timeout_minutes: u64,
+) -> Result<CodexExecRun> {
+    let mut args = codex_pre_args.to_vec();
+    args.push("exec".to_string());
+    args.extend(codex_exec_args.iter().cloned());
+    args.push("--json".to_string());
+    args.push(prompt.to_string());
+
+    let timeout = Duration::from_secs(timeout_minutes.saturating_mul(60));
+    let mut child = Command::new(codex_cmd)
+        .args(&args)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to execute {}", codex_cmd))?;
+    let started = Instant::now();
+    let mut timed_out = false;
+    loop {
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        if started.elapsed() >= timeout {
+            timed_out = true;
+            let _ = child.kill();
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("failed waiting for {}", codex_cmd))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let report = extract_last_agent_message(&stdout).unwrap_or_else(|| {
+        let merged = format!("{} {}", stdout.trim(), stderr.trim());
+        merged.chars().take(4000).collect()
+    });
+
+    Ok(CodexExecRun {
+        report,
+        exit_code: output.status.code(),
+        timed_out,
+    })
+}
+
+fn extract_last_agent_message(stdout: &str) -> Option<String> {
+    let mut last = None;
+    for line in stdout.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(|v| v.as_str()) != Some("item.completed") {
+            continue;
+        }
+        let Some(item) = value.get("item") else {
+            continue;
+        };
+        if item.get("type").and_then(|v| v.as_str()) != Some("agent_message") {
+            continue;
+        }
+        if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+            last = Some(text.to_string());
+        }
+    }
+    last
+}
+
+fn cleanup_runtime_state(cwd: &Path) -> Result<()> {
+    let runtime_dir = cwd.join(".forge");
+    fs::create_dir_all(&runtime_dir)
+        .with_context(|| format!("failed to create {}", runtime_dir.display()))?;
+
+    let files = [
+        "status.json",
+        "progress.json",
+        "live.log",
+        ".session_id",
+        ".call_count",
+        ".last_reset",
+        ".circuit_breaker_state",
+        ".circuit_breaker_history",
+    ];
+
+    for file in files {
+        let path = runtime_dir.join(file);
+        if path.exists() {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+        }
+    }
+
+    Ok(())
+}
+
 fn status_command(cmd: StatusCommand, cwd: PathBuf) -> Result<()> {
     let cfg = load_run_config(&cwd, &CliOverrides::default())?;
     let runtime_dir = cwd.join(cfg.runtime_dir);
@@ -471,11 +995,22 @@ fn status_command(cmd: StatusCommand, cwd: PathBuf) -> Result<()> {
     if cmd.json {
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
+        let loop_timer = if status.current_loop_started_at_epoch == 0 {
+            "-".to_string()
+        } else {
+            format_duration(epoch_now().saturating_sub(status.current_loop_started_at_epoch))
+        };
+
         println!("state: {}", status.state);
         println!("current_loop: {}", status.current_loop);
+        println!("loop_timer: {}", loop_timer);
         println!("total_loops_executed: {}", status.total_loops_executed);
         println!("completion_indicators: {}", status.completion_indicators);
         println!("exit_signal_seen: {}", status.exit_signal_seen);
+        println!(
+            "last_heartbeat_at_epoch: {}",
+            status.last_heartbeat_at_epoch
+        );
         println!(
             "session_id: {}",
             status.session_id.unwrap_or_else(|| "-".to_string())
@@ -489,6 +1024,219 @@ fn monitor_command(cmd: MonitorCommand, cwd: PathBuf) -> Result<()> {
     let cfg = load_run_config(&cwd, &CliOverrides::default())?;
     let runtime_dir: PathBuf = cwd.join(cfg.runtime_dir);
     run_monitor(&runtime_dir, cmd.refresh_ms)
+}
+
+fn doctor_command(cmd: DoctorCommand, cwd: PathBuf) -> Result<()> {
+    let before = collect_doctor_checks(&cwd);
+    let before_warnings = collect_doctor_warnings(&cwd);
+    let mut attempted_fixes = Vec::new();
+    if cmd.fix {
+        attempted_fixes = apply_doctor_fixes(&cwd)?;
+    }
+    let checks = collect_doctor_checks(&cwd);
+    let failed = checks.iter().filter(|c| !c.ok).count();
+    let warnings = collect_doctor_warnings(&cwd);
+    let strict_failed = cmd.strict && !warnings.is_empty();
+
+    if cmd.json {
+        let report = serde_json::json!({
+            "cwd": cwd.display().to_string(),
+            "ok": failed == 0 && !strict_failed,
+            "failed_checks": failed,
+            "fix_mode": cmd.fix,
+            "strict_mode": cmd.strict,
+            "attempted_fixes": attempted_fixes,
+            "before_warnings": before_warnings,
+            "before": before
+                .iter()
+                .map(|c| serde_json::json!({
+                    "name": c.name,
+                    "ok": c.ok,
+                    "detail": c.detail,
+                }))
+                .collect::<Vec<_>>(),
+            "warnings": warnings,
+            "checks": checks
+                .iter()
+                .map(|c| serde_json::json!({
+                    "name": c.name,
+                    "ok": c.ok,
+                    "detail": c.detail,
+                }))
+                .collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("forge doctor");
+        println!("cwd: {}", cwd.display());
+        println!("strict_mode: {}", cmd.strict);
+        if cmd.fix {
+            if attempted_fixes.is_empty() {
+                println!("- fix: no changes applied");
+            } else {
+                for fix in &attempted_fixes {
+                    println!("- fix: {}", fix);
+                }
+            }
+        }
+        for c in &checks {
+            let status = if c.ok { "ok" } else { "fail" };
+            println!("- {}: {} ({})", c.name, status, c.detail);
+        }
+        if warnings.is_empty() {
+            println!("- warnings: none");
+        } else {
+            for warning in &warnings {
+                println!("- warning: {}", warning);
+            }
+        }
+    }
+
+    if failed > 0 {
+        bail!("doctor found {} failing check(s)", failed);
+    }
+    if strict_failed {
+        bail!("doctor strict mode failed: {} warning(s)", warnings.len());
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct DoctorCheck {
+    name: &'static str,
+    ok: bool,
+    detail: String,
+}
+
+fn collect_doctor_checks(cwd: &Path) -> Vec<DoctorCheck> {
+    let codex = check_codex_available();
+    let git = check_git_repo(cwd);
+    let write = check_runtime_writable(cwd);
+    let config = check_config_loadable(cwd);
+    vec![
+        DoctorCheck {
+            name: "codex_available",
+            ok: codex.0,
+            detail: codex.1,
+        },
+        DoctorCheck {
+            name: "git_repository",
+            ok: git.0,
+            detail: git.1,
+        },
+        DoctorCheck {
+            name: "runtime_writable",
+            ok: write.0,
+            detail: write.1,
+        },
+        DoctorCheck {
+            name: "config_loadable",
+            ok: config.0,
+            detail: config.1,
+        },
+    ]
+}
+
+fn apply_doctor_fixes(cwd: &Path) -> Result<Vec<String>> {
+    let mut fixes = Vec::new();
+
+    let runtime_dir = cwd.join(".forge");
+    if !runtime_dir.exists() {
+        fs::create_dir_all(&runtime_dir)
+            .with_context(|| format!("failed to create {}", runtime_dir.display()))?;
+        fixes.push("created .forge runtime directory".to_string());
+    }
+
+    let forgerc = cwd.join(".forgerc");
+    if !forgerc.exists() {
+        let template = "# forge defaults\nmax_calls_per_hour = 100\ntimeout_minutes = 15\n";
+        fs::write(&forgerc, template)
+            .with_context(|| format!("failed to write {}", forgerc.display()))?;
+        fixes.push("created .forgerc with baseline defaults".to_string());
+    }
+
+    Ok(fixes)
+}
+
+fn collect_doctor_warnings(cwd: &Path) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if !cwd.join(".forgerc").exists() {
+        warnings.push("missing .forgerc (using only env/defaults)".to_string());
+    }
+    if !cwd
+        .join(".forge")
+        .join("analyze")
+        .join("latest.json")
+        .exists()
+    {
+        warnings.push("no persisted analyze report yet (.forge/analyze/latest.json)".to_string());
+    }
+    warnings
+}
+
+fn check_codex_available() -> (bool, String) {
+    match Command::new("codex").arg("--version").output() {
+        Ok(output) if output.status.success() => {
+            let v = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            (
+                true,
+                if v.is_empty() {
+                    "codex found".to_string()
+                } else {
+                    v
+                },
+            )
+        }
+        Ok(output) => (
+            false,
+            format!("codex returned exit code {:?}", output.status.code()),
+        ),
+        Err(err) => (false, format!("codex not available: {}", err)),
+    }
+}
+
+fn check_git_repo(cwd: &Path) -> (bool, String) {
+    match Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(cwd)
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if s == "true" {
+                (true, "inside git work tree".to_string())
+            } else {
+                (false, format!("unexpected git response: {}", s))
+            }
+        }
+        Ok(output) => (
+            false,
+            format!("git returned exit code {:?}", output.status.code()),
+        ),
+        Err(err) => (false, format!("git not available: {}", err)),
+    }
+}
+
+fn check_runtime_writable(cwd: &Path) -> (bool, String) {
+    let runtime_dir = cwd.join(".forge");
+    if let Err(err) = fs::create_dir_all(&runtime_dir) {
+        return (false, format!("cannot create .forge: {}", err));
+    }
+    let probe = runtime_dir.join(".doctor_write_probe");
+    match fs::write(&probe, "ok") {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe);
+            (true, "runtime is writable".to_string())
+        }
+        Err(err) => (false, format!("cannot write runtime probe: {}", err)),
+    }
+}
+
+fn check_config_loadable(cwd: &Path) -> (bool, String) {
+    match load_run_config(cwd, &CliOverrides::default()) {
+        Ok(_) => (true, ".forgerc/env/defaults load".to_string()),
+        Err(err) => (false, format!("config error: {}", err)),
+    }
 }
 
 fn resolve_cwd(cwd: Option<PathBuf>) -> Result<PathBuf> {
@@ -583,4 +1331,11 @@ fn epoch_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::from_secs(0))
         .as_secs()
+}
+
+fn format_duration(total_secs: u64) -> String {
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
 }

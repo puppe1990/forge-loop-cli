@@ -6,8 +6,9 @@ use serde_json::Value;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitReason {
@@ -59,6 +60,10 @@ pub fn run_loop(req: RunRequest) -> Result<RunOutcome> {
 
     while loop_count < req.max_loops {
         loop_count += 1;
+        status.current_loop = loop_count;
+        status.current_loop_started_at_epoch = epoch_now();
+        status.updated_at_epoch = epoch_now();
+        write_json(&runtime_dir.join("status.json"), &status)?;
 
         let rate = check_and_increment_call_count(&runtime_dir, req.config.max_calls_per_hour)?;
         if !rate.allowed {
@@ -76,7 +81,17 @@ pub fn run_loop(req: RunRequest) -> Result<RunOutcome> {
             });
         }
 
-        let (stdout, stderr, exit_ok) = execute_iteration(&req.cwd, &req.config)?;
+        let mut last_heartbeat = Instant::now();
+        let (stdout, stderr, exit_ok, timed_out) =
+            execute_iteration(&req.cwd, &req.config, || {
+                if last_heartbeat.elapsed() >= Duration::from_secs(1) {
+                    status.last_heartbeat_at_epoch = epoch_now();
+                    status.updated_at_epoch = epoch_now();
+                    write_json(&runtime_dir.join("status.json"), &status)?;
+                    last_heartbeat = Instant::now();
+                }
+                Ok(())
+            })?;
         append_live_log(&runtime_dir.join("live.log"), &stdout, &stderr)?;
 
         let analysis = analyze_output(&stdout, &stderr, &req.config.completion_indicators);
@@ -105,11 +120,12 @@ pub fn run_loop(req: RunRequest) -> Result<RunOutcome> {
         progress.last_summary = summarize_output(&stdout, &stderr);
         progress.updated_at_epoch = epoch_now();
 
-        status.current_loop = loop_count;
         status.total_loops_executed += 1;
         status.exit_signal_seen = analysis.exit_signal_true;
         status.completion_indicators = analysis.completion_indicators;
-        status.last_error = if analysis.has_error {
+        status.last_error = if timed_out {
+            Some("iteration timed out".to_string())
+        } else if analysis.has_error {
             Some("error marker found in output".to_string())
         } else {
             None
@@ -165,33 +181,67 @@ pub fn run_loop(req: RunRequest) -> Result<RunOutcome> {
     })
 }
 
-fn execute_iteration(cwd: &Path, config: &RunConfig) -> Result<(String, String, bool)> {
+fn execute_iteration<F>(
+    cwd: &Path,
+    config: &RunConfig,
+    mut heartbeat: F,
+) -> Result<(String, String, bool, bool)>
+where
+    F: FnMut() -> Result<()>,
+{
     let args = build_command_args(config, cwd);
-    let _timeout_minutes = config.timeout_minutes;
-
-    let output = Command::new(&config.codex_cmd)
+    let timeout = Duration::from_secs(config.timeout_minutes.saturating_mul(60));
+    let mut child = Command::new(&config.codex_cmd)
         .args(&args)
         .current_dir(cwd)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .with_context(|| format!("failed to execute {}", config.codex_cmd))?;
 
+    let started = Instant::now();
+    let mut timed_out = false;
+    loop {
+        heartbeat()?;
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        if started.elapsed() >= timeout {
+            timed_out = true;
+            let _ = child.kill();
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("failed waiting for {}", config.codex_cmd))?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    Ok((stdout, stderr, output.status.success()))
+    Ok((stdout, stderr, output.status.success(), timed_out))
 }
 
-fn build_exec_args(mode: &ResumeMode, cwd: &Path) -> Vec<String> {
+fn build_exec_args(mode: &ResumeMode, cwd: &Path, exec_args: &[String]) -> Vec<String> {
     let mut args = match mode {
-        ResumeMode::New => vec!["exec".into(), "--json".into()],
-        ResumeMode::Explicit(id) => {
-            vec!["exec".into(), "resume".into(), id.clone(), "--json".into()]
+        ResumeMode::New => {
+            let mut v = vec!["exec".into()];
+            v.extend(exec_args.iter().cloned());
+            v.push("--json".into());
+            v
         }
-        ResumeMode::Last => vec![
-            "exec".into(),
-            "resume".into(),
-            "--last".into(),
-            "--json".into(),
-        ],
+        ResumeMode::Explicit(id) => {
+            let mut v = vec!["exec".into()];
+            v.extend(exec_args.iter().cloned());
+            v.extend(vec!["resume".into(), id.clone(), "--json".into()]);
+            v
+        }
+        ResumeMode::Last => {
+            let mut v = vec!["exec".into()];
+            v.extend(exec_args.iter().cloned());
+            v.extend(vec!["resume".into(), "--last".into(), "--json".into()]);
+            v
+        }
     };
 
     let plan_file = cwd.join(".forge/plan.md");
@@ -207,7 +257,11 @@ fn build_exec_args(mode: &ResumeMode, cwd: &Path) -> Vec<String> {
 
 fn build_command_args(config: &RunConfig, cwd: &Path) -> Vec<String> {
     let mut args = config.codex_pre_args.clone();
-    args.extend(build_exec_args(&config.resume_mode, cwd));
+    args.extend(build_exec_args(
+        &config.resume_mode,
+        cwd,
+        &config.codex_exec_args,
+    ));
     args
 }
 
@@ -413,7 +467,7 @@ mod tests {
         fs::write(forge_dir.join("plan.md"), "Refactor architecture in phases")
             .expect("write plan");
 
-        let args = build_exec_args(&ResumeMode::New, dir.path());
+        let args = build_exec_args(&ResumeMode::New, dir.path(), &[]);
 
         assert!(args.contains(&"exec".to_string()));
         assert!(args.contains(&"--json".to_string()));
@@ -430,7 +484,7 @@ mod tests {
         fs::create_dir_all(&forge_dir).expect("create .forge");
         fs::write(forge_dir.join("plan.md"), "   \n").expect("write empty plan");
 
-        let args = build_exec_args(&ResumeMode::Last, dir.path());
+        let args = build_exec_args(&ResumeMode::Last, dir.path(), &[]);
 
         assert_eq!(
             args,
@@ -449,6 +503,7 @@ mod tests {
         let cfg = RunConfig {
             codex_cmd: "codex".to_string(),
             codex_pre_args: vec!["--sandbox".to_string(), "danger-full-access".to_string()],
+            codex_exec_args: vec![],
             max_calls_per_hour: 100,
             timeout_minutes: 15,
             runtime_dir: PathBuf::from(".forge"),
@@ -465,5 +520,30 @@ mod tests {
         assert_eq!(args[1], "danger-full-access");
         assert_eq!(args[2], "exec");
         assert_eq!(args[3], "--json");
+    }
+
+    #[test]
+    fn build_command_args_includes_exec_args_after_exec() {
+        let dir = tempdir().expect("tempdir");
+        let cfg = RunConfig {
+            codex_cmd: "codex".to_string(),
+            codex_pre_args: vec!["-s".to_string(), "danger-full-access".to_string()],
+            codex_exec_args: vec!["--ephemeral".to_string()],
+            max_calls_per_hour: 100,
+            timeout_minutes: 15,
+            runtime_dir: PathBuf::from(".forge"),
+            completion_indicators: vec!["STATUS: COMPLETE".to_string()],
+            auto_wait_on_rate_limit: false,
+            sleep_on_rate_limit_secs: 60,
+            no_progress_limit: 3,
+            resume_mode: ResumeMode::New,
+        };
+
+        let args = build_command_args(&cfg, dir.path());
+        assert_eq!(args[0], "-s");
+        assert_eq!(args[1], "danger-full-access");
+        assert_eq!(args[2], "exec");
+        assert_eq!(args[3], "--ephemeral");
+        assert_eq!(args[4], "--json");
     }
 }

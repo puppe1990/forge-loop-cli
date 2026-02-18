@@ -3,19 +3,40 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
+  verify:
+    name: Verify (fmt + clippy + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+
   build:
+    name: Build ${{ matrix.target }}
+    needs: verify
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact: forge-linux-x86_64
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact: forge-macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -23,11 +44,43 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --package forge --target ${{ matrix.target }}
-      - run: |
+      - name: Build binary
+        run: cargo build --release --package forge --target ${{ matrix.target }}
+      - name: Package archive
+        run: |
+          set -euo pipefail
           mkdir -p dist
           cp target/${{ matrix.target }}/release/forge dist/
-          tar -C dist -czf ${{ matrix.artifact }}.tar.gz forge
-      - uses: softprops/action-gh-release@v2
+          ARCHIVE="forge-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+          tar -C dist -czf "$ARCHIVE" forge
+          shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
         with:
-          files: ${{ matrix.artifact }}.tar.gz
+          name: forge-${{ matrix.target }}
+          path: |
+            forge-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+            forge-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+      - name: Flatten artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find release-artifacts -type f -maxdepth 3 -exec cp {} out/ \;
+          ls -la out
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

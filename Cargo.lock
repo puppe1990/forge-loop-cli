@@ -346,6 +346,7 @@ dependencies = [
  "forge-core",
  "forge-types",
  "ratatui",
+ "serde_json",
 ]
 
 [[package]]

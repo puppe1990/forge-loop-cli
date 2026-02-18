@@ -15,6 +15,7 @@ pub enum ResumeMode {
 pub struct RunConfig {
     pub codex_cmd: String,
     pub codex_pre_args: Vec<String>,
+    pub codex_exec_args: Vec<String>,
     pub max_calls_per_hour: u32,
     pub timeout_minutes: u64,
     pub runtime_dir: PathBuf,
@@ -28,6 +29,7 @@ pub struct RunConfig {
 #[derive(Debug, Clone, Default)]
 pub struct CliOverrides {
     pub codex_pre_args: Option<Vec<String>>,
+    pub codex_exec_args: Option<Vec<String>>,
     pub max_calls_per_hour: Option<u32>,
     pub timeout_minutes: Option<u64>,
     pub resume: Option<String>,
@@ -38,6 +40,7 @@ pub struct CliOverrides {
 struct Forgerc {
     codex_cmd: Option<String>,
     codex_pre_args: Option<Vec<String>>,
+    codex_exec_args: Option<Vec<String>>,
     max_calls_per_hour: Option<u32>,
     timeout_minutes: Option<u64>,
     runtime_dir: Option<String>,
@@ -76,6 +79,13 @@ pub fn load_run_config(cwd: &Path, overrides: &CliOverrides) -> Result<RunConfig
         overrides.codex_pre_args.clone(),
         env_whitespace_args("FORGE_CODEX_PRE_ARGS"),
         file_cfg.codex_pre_args,
+    )
+    .unwrap_or_default();
+
+    let codex_exec_args = first_some(
+        overrides.codex_exec_args.clone(),
+        env_whitespace_args("FORGE_CODEX_EXEC_ARGS"),
+        file_cfg.codex_exec_args,
     )
     .unwrap_or_default();
 
@@ -141,6 +151,7 @@ pub fn load_run_config(cwd: &Path, overrides: &CliOverrides) -> Result<RunConfig
     Ok(RunConfig {
         codex_cmd,
         codex_pre_args,
+        codex_exec_args,
         max_calls_per_hour,
         timeout_minutes,
         runtime_dir,

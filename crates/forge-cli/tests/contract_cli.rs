@@ -16,6 +16,8 @@ fn help_shows_subcommands() {
         .stdout(contains("--cwd"))
         .stdout(contains("interactive assistant mode"))
         .stdout(contains("run"))
+        .stdout(contains("analyze"))
+        .stdout(contains("doctor"))
         .stdout(contains("status"))
         .stdout(contains("monitor"))
         .stdout(contains("sdd"));
@@ -30,6 +32,7 @@ fn run_help_shows_required_flags() {
         .stdout(contains("--codex-arg"))
         .stdout(contains("--resume"))
         .stdout(contains("--resume-last"))
+        .stdout(contains("--fresh"))
         .stdout(contains("--max-calls-per-hour"))
         .stdout(contains("--timeout-minutes"));
 }
@@ -40,6 +43,38 @@ fn run_rejects_conflicting_resume_flags() {
     cmd.args(["run", "--resume", "abc", "--resume-last"])
         .assert()
         .failure();
+}
+
+#[test]
+fn run_rejects_fresh_with_resume() {
+    let mut cmd = forge_cmd();
+    cmd.args(["run", "--fresh", "--resume", "abc"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn analyze_help_shows_flags() {
+    let mut cmd = forge_cmd();
+    cmd.args(["analyze", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--modified-only"))
+        .stdout(contains("--chunk-size"))
+        .stdout(contains("--resume-latest-report"))
+        .stdout(contains("--codex-arg"))
+        .stdout(contains("--timeout-minutes"));
+}
+
+#[test]
+fn doctor_help_shows_json_flag() {
+    let mut cmd = forge_cmd();
+    cmd.args(["doctor", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--json"))
+        .stdout(contains("--fix"))
+        .stdout(contains("--strict"));
 }
 
 #[test]
