@@ -4,9 +4,10 @@ use forge_types::{CircuitBreakerState, CircuitState, ProgressSnapshot, RunStatus
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -53,6 +54,7 @@ pub fn run_loop(req: RunRequest) -> Result<RunOutcome> {
 
     status.state = "running".to_string();
     status.thinking_mode = req.config.thinking_mode.as_str().to_string();
+    status.run_started_at_epoch = epoch_now();
     status.updated_at_epoch = epoch_now();
     status.circuit_state = circuit.state.clone();
     write_json(&runtime_dir.join("status.json"), &status)?;
@@ -89,9 +91,13 @@ pub fn run_loop(req: RunRequest) -> Result<RunOutcome> {
             });
         }
 
-        let mut last_heartbeat = Instant::now();
+        status.last_heartbeat_at_epoch = epoch_now();
+        write_json(&runtime_dir.join("status.json"), &status)?;
+        let mut last_heartbeat = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .unwrap_or_else(Instant::now);
         let (stdout, stderr, exit_ok, timed_out) =
-            execute_iteration(&req.cwd, &req.config, || {
+            execute_iteration(&req.cwd, &req.config, &runtime_dir.join("live.log"), || {
                 if last_heartbeat.elapsed() >= Duration::from_secs(1) {
                     status.last_heartbeat_at_epoch = epoch_now();
                     status.updated_at_epoch = epoch_now();
@@ -100,7 +106,6 @@ pub fn run_loop(req: RunRequest) -> Result<RunOutcome> {
                 }
                 Ok(())
             })?;
-        append_live_log(&runtime_dir.join("live.log"), &stdout, &stderr)?;
         let end_state = if timed_out {
             "timed_out"
         } else if exit_ok {
@@ -203,6 +208,7 @@ pub fn run_loop(req: RunRequest) -> Result<RunOutcome> {
 fn execute_iteration<F>(
     cwd: &Path,
     config: &RunConfig,
+    live_log_path: &Path,
     mut heartbeat: F,
 ) -> Result<(String, String, bool, bool)>
 where
@@ -224,29 +230,124 @@ where
         .spawn()
         .with_context(|| format!("failed to execute {}", config.codex_cmd))?;
 
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture stdout pipe from codex process")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture stderr pipe from codex process")?;
+
+    let (tx, rx) = mpsc::channel::<StreamEvent>();
+    let stdout_handle = spawn_stream_reader(stdout, StreamSource::Stdout, tx.clone());
+    let stderr_handle = spawn_stream_reader(stderr, StreamSource::Stderr, tx);
+
     let started = Instant::now();
     let mut timed_out = false;
+    let mut finished = false;
+    let mut exit_ok = false;
+    let mut open_streams = 2_u8;
+    let mut stdout_buf = String::new();
+    let mut stderr_buf = String::new();
+
     loop {
-        heartbeat()?;
-        if child.try_wait()?.is_some() {
-            break;
-        }
-        if let Some(limit) = timeout {
-            if started.elapsed() >= limit {
-                timed_out = true;
-                let _ = child.kill();
-                break;
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(StreamEvent::Chunk { source, chunk }) => {
+                heartbeat()?;
+                match source {
+                    StreamSource::Stdout => {
+                        stdout_buf.push_str(&chunk);
+                        append_history(live_log_path, &chunk)?;
+                    }
+                    StreamSource::Stderr => {
+                        stderr_buf.push_str(&chunk);
+                        append_history(live_log_path, &format!("[stderr] {chunk}"))?;
+                    }
+                }
+            }
+            Ok(StreamEvent::Closed) => {
+                heartbeat()?;
+                open_streams = open_streams.saturating_sub(1);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                open_streams = 0;
             }
         }
-        thread::sleep(Duration::from_millis(200));
+
+        if !finished {
+            if let Some(status) = child.try_wait()? {
+                finished = true;
+                exit_ok = status.success();
+            } else if let Some(limit) = timeout {
+                if started.elapsed() >= limit {
+                    timed_out = true;
+                    let _ = child.kill();
+                    let status = child
+                        .wait()
+                        .with_context(|| format!("failed waiting for {}", config.codex_cmd))?;
+                    finished = true;
+                    exit_ok = status.success();
+                }
+            }
+        }
+
+        if finished && open_streams == 0 {
+            break;
+        }
     }
 
-    let output = child
-        .wait_with_output()
-        .with_context(|| format!("failed waiting for {}", config.codex_cmd))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    Ok((stdout, stderr, output.status.success(), timed_out))
+    for handle in [stdout_handle, stderr_handle] {
+        let _ = handle.join();
+    }
+
+    Ok((stdout_buf, stderr_buf, exit_ok, timed_out))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StreamSource {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Debug)]
+enum StreamEvent {
+    Chunk { source: StreamSource, chunk: String },
+    Closed,
+}
+
+fn spawn_stream_reader<R>(
+    reader: R,
+    source: StreamSource,
+    tx: mpsc::Sender<StreamEvent>,
+) -> thread::JoinHandle<()>
+where
+    R: std::io::Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    let _ = tx.send(StreamEvent::Closed);
+                    break;
+                }
+                Ok(_) => {
+                    let _ = tx.send(StreamEvent::Chunk {
+                        source,
+                        chunk: line.clone(),
+                    });
+                }
+                Err(_) => {
+                    let _ = tx.send(StreamEvent::Closed);
+                    break;
+                }
+            }
+        }
+    })
 }
 
 fn build_exec_args(mode: &ResumeMode, cwd: &Path, exec_args: &[String]) -> Vec<String> {
@@ -415,22 +516,6 @@ fn read_json_or_default<T: DeserializeOwned + Default>(path: &Path) -> T {
         Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
         Err(_) => T::default(),
     }
-}
-
-fn append_live_log(path: &Path, stdout: &str, stderr: &str) -> Result<()> {
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
-
-    if !stdout.trim().is_empty() {
-        writeln!(file, "[stdout]\n{}", stdout.trim()).context("failed to write stdout log")?;
-    }
-    if !stderr.trim().is_empty() {
-        writeln!(file, "[stderr]\n{}", stderr.trim()).context("failed to write stderr log")?;
-    }
-    Ok(())
 }
 
 fn append_live_activity(path: &Path, text: &str) -> Result<()> {

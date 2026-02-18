@@ -30,6 +30,7 @@ fn run_help_shows_required_flags() {
         .assert()
         .success()
         .stdout(contains("--codex-arg"))
+        .stdout(contains("--full-access"))
         .stdout(contains("--resume"))
         .stdout(contains("--resume-last"))
         .stdout(contains("--fresh"))
@@ -65,6 +66,7 @@ fn analyze_help_shows_flags() {
         .stdout(contains("--resume-latest-report"))
         .stdout(contains("--thinking"))
         .stdout(contains("--codex-arg"))
+        .stdout(contains("--full-access"))
         .stdout(contains("--timeout-minutes"));
 }
 

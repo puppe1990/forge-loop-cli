@@ -29,6 +29,7 @@ impl Default for CircuitBreakerState {
 pub struct RunStatus {
     pub state: String,
     pub thinking_mode: String,
+    pub run_started_at_epoch: u64,
     pub current_loop: u64,
     pub total_loops_executed: u64,
     pub last_error: Option<String>,
@@ -46,6 +47,7 @@ impl Default for RunStatus {
         Self {
             state: "idle".to_string(),
             thinking_mode: "summary".to_string(),
+            run_started_at_epoch: 0,
             current_loop: 0,
             total_loops_executed: 0,
             last_error: None,

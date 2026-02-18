@@ -41,6 +41,9 @@ struct RunCommand {
     #[arg(long = "codex-arg")]
     codex_pre_args: Vec<String>,
 
+    #[arg(long)]
+    full_access: bool,
+
     #[arg(long, value_enum)]
     thinking: Option<ThinkingArg>,
 
@@ -77,6 +80,9 @@ struct AnalyzeCommand {
     #[arg(long = "codex-arg")]
     codex_pre_args: Vec<String>,
 
+    #[arg(long)]
+    full_access: bool,
+
     #[arg(long, value_enum)]
     thinking: Option<ThinkingArg>,
 
@@ -100,6 +106,9 @@ struct AnalyzeCommand {
 struct MonitorCommand {
     #[arg(long, default_value_t = 500)]
     refresh_ms: u64,
+
+    #[arg(long, default_value_t = 15)]
+    stall_threshold_secs: u64,
 }
 
 #[derive(Debug, clap::Args)]
@@ -204,6 +213,7 @@ fn assistant_mode(cwd: PathBuf) -> Result<()> {
     run_command(
         RunCommand {
             codex_pre_args: Vec::new(),
+            full_access: false,
             thinking: Some(answers.thinking),
             resume: None,
             resume_last: false,
@@ -518,7 +528,7 @@ fn run_command(cmd: RunCommand, cwd: PathBuf) -> Result<()> {
         cleanup_runtime_state(&cwd)?;
     }
 
-    let codex_pre_args = cmd.codex_pre_args;
+    let codex_pre_args = with_full_access_args(cmd.codex_pre_args.clone(), cmd.full_access);
     let codex_exec_args = if cmd.fresh {
         Some(vec!["--ephemeral".to_string()])
     } else {
@@ -573,10 +583,11 @@ fn run_command(cmd: RunCommand, cwd: PathBuf) -> Result<()> {
 }
 
 fn analyze_command(cmd: AnalyzeCommand, cwd: PathBuf) -> Result<()> {
-    let codex_pre_args_override = if cmd.codex_pre_args.is_empty() {
+    let codex_pre_args = with_full_access_args(cmd.codex_pre_args.clone(), cmd.full_access);
+    let codex_pre_args_override = if codex_pre_args.is_empty() {
         None
     } else {
-        Some(cmd.codex_pre_args.clone())
+        Some(codex_pre_args)
     };
 
     let cfg = load_run_config(
@@ -737,6 +748,35 @@ fn analyze_command(cmd: AnalyzeCommand, cwd: PathBuf) -> Result<()> {
         bail!("analyze failed in {} chunk(s)", failed_chunks);
     }
     Ok(())
+}
+
+fn with_full_access_args(args: Vec<String>, full_access: bool) -> Vec<String> {
+    if !full_access {
+        return args;
+    }
+
+    let mut out = Vec::new();
+    let mut i = 0_usize;
+    while i < args.len() {
+        let current = &args[i];
+        if current == "--sandbox" || current == "-s" {
+            i += 1;
+            if i < args.len() {
+                i += 1;
+            }
+            continue;
+        }
+        if current.starts_with("--sandbox=") {
+            i += 1;
+            continue;
+        }
+        out.push(current.clone());
+        i += 1;
+    }
+
+    out.push("--sandbox".to_string());
+    out.push("danger-full-access".to_string());
+    out
 }
 
 fn analyze_resume_latest(
@@ -1058,7 +1098,12 @@ fn status_command(cmd: StatusCommand, cwd: PathBuf) -> Result<()> {
     if cmd.json {
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
-        let loop_timer = if status.current_loop_started_at_epoch == 0 {
+        let run_timer = if status.run_started_at_epoch == 0 {
+            "-".to_string()
+        } else {
+            format_duration(epoch_now().saturating_sub(status.run_started_at_epoch))
+        };
+        let command_timer = if status.current_loop_started_at_epoch == 0 {
             "-".to_string()
         } else {
             format_duration(epoch_now().saturating_sub(status.current_loop_started_at_epoch))
@@ -1066,8 +1111,9 @@ fn status_command(cmd: StatusCommand, cwd: PathBuf) -> Result<()> {
 
         println!("state: {}", status.state);
         println!("thinking_mode: {}", status.thinking_mode);
+        println!("run_timer: {}", run_timer);
         println!("current_loop: {}", status.current_loop);
-        println!("loop_timer: {}", loop_timer);
+        println!("command_timer: {}", command_timer);
         println!("total_loops_executed: {}", status.total_loops_executed);
         println!("completion_indicators: {}", status.completion_indicators);
         println!("exit_signal_seen: {}", status.exit_signal_seen);
@@ -1087,7 +1133,11 @@ fn status_command(cmd: StatusCommand, cwd: PathBuf) -> Result<()> {
 fn monitor_command(cmd: MonitorCommand, cwd: PathBuf) -> Result<()> {
     let cfg = load_run_config(&cwd, &CliOverrides::default())?;
     let runtime_dir: PathBuf = cwd.join(cfg.runtime_dir);
-    run_monitor(&runtime_dir, cmd.refresh_ms)
+    run_monitor(
+        &runtime_dir,
+        cmd.refresh_ms,
+        cmd.stall_threshold_secs.max(1),
+    )
 }
 
 fn doctor_command(cmd: DoctorCommand, cwd: PathBuf) -> Result<()> {
@@ -1402,4 +1452,45 @@ fn format_duration(total_secs: u64) -> String {
     let minutes = (total_secs % 3600) / 60;
     let seconds = total_secs % 60;
     format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_full_access_args;
+
+    #[test]
+    fn full_access_adds_danger_sandbox_when_missing() {
+        let args = with_full_access_args(vec!["--foo".to_string()], true);
+        assert_eq!(
+            args,
+            vec![
+                "--foo".to_string(),
+                "--sandbox".to_string(),
+                "danger-full-access".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn full_access_replaces_existing_sandbox_variants() {
+        let args = with_full_access_args(
+            vec![
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
+                "-s".to_string(),
+                "read-only".to_string(),
+                "--sandbox=foo".to_string(),
+                "--bar".to_string(),
+            ],
+            true,
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--bar".to_string(),
+                "--sandbox".to_string(),
+                "danger-full-access".to_string()
+            ]
+        );
+    }
 }
