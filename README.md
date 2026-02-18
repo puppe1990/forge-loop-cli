@@ -27,6 +27,8 @@ codex --version
 - `forge run`
 - `forge status`
 - `forge monitor`
+- `forge sdd list`
+- `forge sdd load <id>`
 
 ## Assistant mode flow
 
@@ -41,12 +43,27 @@ Running `forge` with no subcommand starts an interview in phases:
 
 It generates:
 
+- `.forge/sdds/<id>/` (snapshoted SDD files)
 - `.forge/plan.md`
 - `docs/specs/session/spec.md`
 - `docs/specs/session/acceptance.md`
 - `docs/specs/session/scenarios.md`
 
 Then it executes `forge run` in loop mode automatically.
+
+## Reuse Existing SDDs
+
+List saved SDD snapshots:
+
+```bash
+forge --cwd /path/to/project sdd list
+```
+
+Load a previous SDD snapshot as the active plan/spec:
+
+```bash
+forge --cwd /path/to/project sdd load <id>
+```
 
 ## Runtime files
 

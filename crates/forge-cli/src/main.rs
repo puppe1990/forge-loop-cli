@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use forge_config::{load_run_config, CliOverrides};
 use forge_core::{read_status, run_loop, ExitReason, RunRequest};
@@ -29,6 +29,7 @@ enum Commands {
     Run(RunCommand),
     Status(StatusCommand),
     Monitor(MonitorCommand),
+    Sdd(SddCommand),
 }
 
 #[derive(Debug, clap::Args)]
@@ -64,6 +65,29 @@ struct MonitorCommand {
     refresh_ms: u64,
 }
 
+#[derive(Debug, clap::Args)]
+struct SddCommand {
+    #[command(subcommand)]
+    action: SddAction,
+}
+
+#[derive(Debug, Subcommand)]
+enum SddAction {
+    List(SddListCommand),
+    Load(SddLoadCommand),
+}
+
+#[derive(Debug, clap::Args)]
+struct SddListCommand {
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct SddLoadCommand {
+    id: String,
+}
+
 #[derive(Debug)]
 struct SddInterview {
     project_name: String,
@@ -86,6 +110,7 @@ fn main() -> Result<()> {
         Some(Commands::Run(cmd)) => run_command(cmd, cwd),
         Some(Commands::Status(cmd)) => status_command(cmd, cwd),
         Some(Commands::Monitor(cmd)) => monitor_command(cmd, cwd),
+        Some(Commands::Sdd(cmd)) => sdd_command(cmd, cwd),
         None => assistant_mode(cwd),
     }
 }
@@ -95,13 +120,16 @@ fn assistant_mode(cwd: PathBuf) -> Result<()> {
     println!("answer the SDD questions. forge will generate specs and run the loop.\n");
 
     let answers = collect_sdd_answers()?;
-    write_sdd_outputs(&cwd, &answers)?;
+    let sdd_id = create_sdd_snapshot(&cwd, &answers)?;
+    activate_sdd(&cwd, &sdd_id)?;
 
-    println!("\nGenerated:");
+    println!("\nGenerated and activated SDD: {sdd_id}");
+    println!("- .forge/sdds/{sdd_id}/plan.md");
     println!("- .forge/plan.md");
     println!("- docs/specs/session/spec.md");
     println!("- docs/specs/session/acceptance.md");
     println!("- docs/specs/session/scenarios.md");
+    println!("\nUse `forge sdd list` and `forge sdd load <id>` to switch plans.");
     println!("\nstarting loop...\n");
 
     run_command(
@@ -115,6 +143,83 @@ fn assistant_mode(cwd: PathBuf) -> Result<()> {
         },
         cwd,
     )
+}
+
+fn sdd_command(cmd: SddCommand, cwd: PathBuf) -> Result<()> {
+    match cmd.action {
+        SddAction::List(list) => sdd_list(cwd.as_path(), list.json),
+        SddAction::Load(load) => {
+            activate_sdd(cwd.as_path(), &load.id)?;
+            println!("loaded sdd: {}", load.id);
+            Ok(())
+        }
+    }
+}
+
+fn sdd_list(cwd: &Path, as_json: bool) -> Result<()> {
+    let root = sdd_root(cwd);
+    let current = current_sdd_id(cwd)?;
+
+    if !root.exists() {
+        if as_json {
+            println!("[]");
+        } else {
+            println!("no sdds found");
+        }
+        return Ok(());
+    }
+
+    let mut entries = fs::read_dir(&root)
+        .with_context(|| format!("failed to read {}", root.display()))?
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .collect::<Vec<_>>();
+
+    entries.sort_by_key(|e| e.file_name());
+    entries.reverse();
+
+    if as_json {
+        let list = entries
+            .iter()
+            .map(|e| {
+                let id = e.file_name().to_string_lossy().to_string();
+                let meta = read_sdd_meta(cwd, &id).unwrap_or_default();
+                serde_json::json!({
+                    "id": id,
+                    "project_name": meta.project_name,
+                    "goal": meta.goal,
+                    "created_at_epoch": meta.created_at_epoch,
+                    "current": current.as_deref() == Some(e.file_name().to_string_lossy().as_ref())
+                })
+            })
+            .collect::<Vec<_>>();
+        println!("{}", serde_json::to_string_pretty(&list)?);
+        return Ok(());
+    }
+
+    if entries.is_empty() {
+        println!("no sdds found");
+        return Ok(());
+    }
+
+    println!("available sdds:");
+    for entry in entries {
+        let id = entry.file_name().to_string_lossy().to_string();
+        let meta = read_sdd_meta(cwd, &id).unwrap_or_default();
+        let marker = if current.as_deref() == Some(id.as_str()) {
+            "*"
+        } else {
+            " "
+        };
+        let title = if meta.project_name.is_empty() {
+            "(no project name)".to_string()
+        } else {
+            meta.project_name
+        };
+        println!("{} {} - {}", marker, id, title);
+    }
+    println!("\n* current");
+    Ok(())
 }
 
 fn collect_sdd_answers() -> Result<SddInterview> {
@@ -181,22 +286,76 @@ fn ask(label: &str, default: &str) -> Result<String> {
     }
 }
 
-fn write_sdd_outputs(cwd: &Path, answers: &SddInterview) -> Result<()> {
+fn create_sdd_snapshot(cwd: &Path, answers: &SddInterview) -> Result<String> {
     let forge_dir = cwd.join(".forge");
+    let sdds_dir = sdd_root(cwd);
     let docs_dir = cwd.join("docs/specs/session");
     fs::create_dir_all(&forge_dir)?;
     fs::create_dir_all(&docs_dir)?;
+    fs::create_dir_all(&sdds_dir)?;
 
     let spec = render_spec(answers);
     let acceptance = render_acceptance(answers);
     let scenarios = render_scenarios(answers);
     let plan = render_plan(answers);
 
-    fs::write(docs_dir.join("spec.md"), spec)?;
-    fs::write(docs_dir.join("acceptance.md"), acceptance)?;
-    fs::write(docs_dir.join("scenarios.md"), scenarios)?;
-    fs::write(forge_dir.join("plan.md"), plan)?;
+    let id = format!(
+        "{}-{}",
+        epoch_now(),
+        slugify(&answers.project_name, "session")
+    );
+    let snapshot_dir = sdds_dir.join(&id);
+    fs::create_dir_all(&snapshot_dir)?;
 
+    fs::write(snapshot_dir.join("spec.md"), &spec)?;
+    fs::write(snapshot_dir.join("acceptance.md"), &acceptance)?;
+    fs::write(snapshot_dir.join("scenarios.md"), &scenarios)?;
+    fs::write(snapshot_dir.join("plan.md"), &plan)?;
+
+    let meta = serde_json::json!({
+        "id": id,
+        "project_name": answers.project_name,
+        "goal": answers.product_goal,
+        "created_at_epoch": epoch_now(),
+    });
+    fs::write(
+        snapshot_dir.join("meta.json"),
+        serde_json::to_string_pretty(&meta)?,
+    )?;
+
+    Ok(id)
+}
+
+fn activate_sdd(cwd: &Path, id: &str) -> Result<()> {
+    let source_dir = sdd_root(cwd).join(id);
+    if !source_dir.exists() {
+        bail!("sdd id not found: {}", id);
+    }
+
+    let forge_dir = cwd.join(".forge");
+    let docs_dir = cwd.join("docs/specs/session");
+    fs::create_dir_all(&forge_dir)?;
+    fs::create_dir_all(&docs_dir)?;
+
+    copy_required(source_dir.join("plan.md"), forge_dir.join("plan.md"))?;
+    copy_required(source_dir.join("spec.md"), docs_dir.join("spec.md"))?;
+    copy_required(
+        source_dir.join("acceptance.md"),
+        docs_dir.join("acceptance.md"),
+    )?;
+    copy_required(
+        source_dir.join("scenarios.md"),
+        docs_dir.join("scenarios.md"),
+    )?;
+
+    fs::write(forge_dir.join("current_sdd"), id)?;
+    Ok(())
+}
+
+fn copy_required(from: PathBuf, to: PathBuf) -> Result<()> {
+    let body =
+        fs::read_to_string(&from).with_context(|| format!("failed to read {}", from.display()))?;
+    fs::write(&to, body).with_context(|| format!("failed to write {}", to.display()))?;
     Ok(())
 }
 
@@ -231,16 +390,15 @@ fn render_scenarios(a: &SddInterview) -> String {
         out.push_str(&format!("## Scenario {}\n{}\n\n", idx + 1, trimmed));
     }
     if out.trim() == "# Session Scenarios" {
-        out.push_str("## Scenario 1\nGiven a planned task When forge run executes Then progress is persisted\n");
+        out.push_str(
+            "## Scenario 1\nGiven a planned task When forge run executes Then progress is persisted\n",
+        );
     }
     out
 }
 
 fn render_plan(a: &SddInterview) -> String {
-    let epoch = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0))
-        .as_secs();
+    let epoch = epoch_now();
 
     format!(
         "# Execution Plan\n\nGenerated at epoch {}\n\n## Goal\n{}\n\n## Scope\n- In: {}\n- Out: {}\n\n## Constraints\n{}\n\n## Acceptance\n{}\n\n## Scenarios\n{}\n\n## Test Strategy\n{}\n\nExecute this plan incrementally. Only stop when completion indicators are present and EXIT_SIGNAL is true. Persist status and progress in .forge/.\n",
@@ -330,4 +488,90 @@ fn resolve_cwd(cwd: Option<PathBuf>) -> Result<PathBuf> {
         None => env::current_dir()?,
     };
     Ok(path.canonicalize()?)
+}
+
+fn sdd_root(cwd: &Path) -> PathBuf {
+    cwd.join(".forge").join("sdds")
+}
+
+fn current_sdd_id(cwd: &Path) -> Result<Option<String>> {
+    let path = cwd.join(".forge").join("current_sdd");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let id = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?
+        .trim()
+        .to_string();
+    if id.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(id))
+    }
+}
+
+#[derive(Default)]
+struct SddMeta {
+    project_name: String,
+    goal: String,
+    created_at_epoch: u64,
+}
+
+fn read_sdd_meta(cwd: &Path, id: &str) -> Result<SddMeta> {
+    let path = sdd_root(cwd).join(id).join("meta.json");
+    if !path.exists() {
+        return Ok(SddMeta::default());
+    }
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(SddMeta {
+        project_name: value
+            .get("project_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        goal: value
+            .get("goal")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        created_at_epoch: value
+            .get("created_at_epoch")
+            .and_then(|v| v.as_u64())
+            .unwrap_or_default(),
+    })
+}
+
+fn slugify(input: &str, fallback: &str) -> String {
+    let slug = input
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+
+    let slug = slug
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+
+    if slug.is_empty() {
+        fallback.to_string()
+    } else {
+        slug
+    }
+}
+
+fn epoch_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0))
+        .as_secs()
 }
