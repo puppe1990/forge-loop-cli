@@ -104,6 +104,20 @@ To run against a different folder without changing directories:
 cargo run -p forge -- --cwd /absolute/path/to/project
 ```
 
+To pass native `codex` global flags through `forge run`:
+
+```bash
+forge --cwd /absolute/path/to/project run \
+  --codex-arg=--sandbox \
+  --codex-arg=danger-full-access
+```
+
+You can also persist these args in `.forgerc`:
+
+```toml
+codex_pre_args = ["--sandbox", "danger-full-access"]
+```
+
 ## License
 
 MIT. See `LICENSE`.

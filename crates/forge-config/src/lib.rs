@@ -14,6 +14,7 @@ pub enum ResumeMode {
 #[derive(Debug, Clone)]
 pub struct RunConfig {
     pub codex_cmd: String,
+    pub codex_pre_args: Vec<String>,
     pub max_calls_per_hour: u32,
     pub timeout_minutes: u64,
     pub runtime_dir: PathBuf,
@@ -26,6 +27,7 @@ pub struct RunConfig {
 
 #[derive(Debug, Clone, Default)]
 pub struct CliOverrides {
+    pub codex_pre_args: Option<Vec<String>>,
     pub max_calls_per_hour: Option<u32>,
     pub timeout_minutes: Option<u64>,
     pub resume: Option<String>,
@@ -35,6 +37,7 @@ pub struct CliOverrides {
 #[derive(Debug, Deserialize, Default)]
 struct Forgerc {
     codex_cmd: Option<String>,
+    codex_pre_args: Option<Vec<String>>,
     max_calls_per_hour: Option<u32>,
     timeout_minutes: Option<u64>,
     runtime_dir: Option<String>,
@@ -68,6 +71,13 @@ pub fn load_run_config(cwd: &Path, overrides: &CliOverrides) -> Result<RunConfig
         Some("codex".to_string()),
     )
     .unwrap_or_else(|| "codex".to_string());
+
+    let codex_pre_args = first_some(
+        overrides.codex_pre_args.clone(),
+        env_whitespace_args("FORGE_CODEX_PRE_ARGS"),
+        file_cfg.codex_pre_args,
+    )
+    .unwrap_or_default();
 
     let max_calls_per_hour = first_some(
         overrides.max_calls_per_hour,
@@ -130,6 +140,7 @@ pub fn load_run_config(cwd: &Path, overrides: &CliOverrides) -> Result<RunConfig
 
     Ok(RunConfig {
         codex_cmd,
+        codex_pre_args,
         max_calls_per_hour,
         timeout_minutes,
         runtime_dir,
@@ -174,5 +185,18 @@ fn env_csv(key: &str) -> Option<Vec<String>> {
         None
     } else {
         Some(parts)
+    }
+}
+
+fn env_whitespace_args(key: &str) -> Option<Vec<String>> {
+    let value = env::var(key).ok()?;
+    let args = value
+        .split_whitespace()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if args.is_empty() {
+        None
+    } else {
+        Some(args)
     }
 }

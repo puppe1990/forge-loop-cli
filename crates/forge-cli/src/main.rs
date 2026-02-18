@@ -34,6 +34,9 @@ enum Commands {
 
 #[derive(Debug, clap::Args)]
 struct RunCommand {
+    #[arg(long = "codex-arg")]
+    codex_pre_args: Vec<String>,
+
     #[arg(long)]
     resume: Option<String>,
 
@@ -134,6 +137,7 @@ fn assistant_mode(cwd: PathBuf) -> Result<()> {
 
     run_command(
         RunCommand {
+            codex_pre_args: Vec::new(),
             resume: None,
             resume_last: false,
             max_calls_per_hour: None,
@@ -417,6 +421,11 @@ fn run_command(cmd: RunCommand, cwd: PathBuf) -> Result<()> {
     let cfg = load_run_config(
         &cwd,
         &CliOverrides {
+            codex_pre_args: if cmd.codex_pre_args.is_empty() {
+                None
+            } else {
+                Some(cmd.codex_pre_args)
+            },
             max_calls_per_hour: cmd.max_calls_per_hour,
             timeout_minutes: cmd.timeout_minutes,
             resume: cmd.resume,

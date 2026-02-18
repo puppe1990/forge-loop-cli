@@ -27,6 +27,7 @@ fn run_help_shows_required_flags() {
     cmd.args(["run", "--help"])
         .assert()
         .success()
+        .stdout(contains("--codex-arg"))
         .stdout(contains("--resume"))
         .stdout(contains("--resume-last"))
         .stdout(contains("--max-calls-per-hour"))

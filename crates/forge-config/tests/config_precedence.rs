@@ -14,6 +14,10 @@ fn cli_overrides_file_values() {
     let cfg = load_run_config(
         dir.path(),
         &CliOverrides {
+            codex_pre_args: Some(vec![
+                "--sandbox".to_string(),
+                "danger-full-access".to_string(),
+            ]),
             max_calls_per_hour: Some(77),
             timeout_minutes: Some(22),
             resume: None,
@@ -24,5 +28,9 @@ fn cli_overrides_file_values() {
 
     assert_eq!(cfg.max_calls_per_hour, 77);
     assert_eq!(cfg.timeout_minutes, 22);
+    assert_eq!(
+        cfg.codex_pre_args,
+        vec!["--sandbox".to_string(), "danger-full-access".to_string()]
+    );
     assert!(matches!(cfg.resume_mode, ResumeMode::Last));
 }

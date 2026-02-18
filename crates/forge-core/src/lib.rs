@@ -166,7 +166,7 @@ pub fn run_loop(req: RunRequest) -> Result<RunOutcome> {
 }
 
 fn execute_iteration(cwd: &Path, config: &RunConfig) -> Result<(String, String, bool)> {
-    let args = build_exec_args(&config.resume_mode, cwd);
+    let args = build_command_args(config, cwd);
     let _timeout_minutes = config.timeout_minutes;
 
     let output = Command::new(&config.codex_cmd)
@@ -202,6 +202,12 @@ fn build_exec_args(mode: &ResumeMode, cwd: &Path) -> Vec<String> {
         }
     }
 
+    args
+}
+
+fn build_command_args(config: &RunConfig, cwd: &Path) -> Vec<String> {
+    let mut args = config.codex_pre_args.clone();
+    args.extend(build_exec_args(&config.resume_mode, cwd));
     args
 }
 
@@ -435,5 +441,29 @@ mod tests {
                 "--json".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn build_command_args_prepends_codex_pre_args() {
+        let dir = tempdir().expect("tempdir");
+        let cfg = RunConfig {
+            codex_cmd: "codex".to_string(),
+            codex_pre_args: vec!["--sandbox".to_string(), "danger-full-access".to_string()],
+            max_calls_per_hour: 100,
+            timeout_minutes: 15,
+            runtime_dir: PathBuf::from(".forge"),
+            completion_indicators: vec!["STATUS: COMPLETE".to_string()],
+            auto_wait_on_rate_limit: false,
+            sleep_on_rate_limit_secs: 60,
+            no_progress_limit: 3,
+            resume_mode: ResumeMode::New,
+        };
+
+        let args = build_command_args(&cfg, dir.path());
+
+        assert_eq!(args[0], "--sandbox");
+        assert_eq!(args[1], "danger-full-access");
+        assert_eq!(args[2], "exec");
+        assert_eq!(args[3], "--json");
     }
 }

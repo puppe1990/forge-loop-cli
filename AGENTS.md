@@ -66,6 +66,11 @@ Always preserve precedence:
 3. `.forgerc`
 4. Defaults
 
+Codex runtime global flags can be passed via:
+
+- `forge run --codex-arg=<value>` (repeatable)
+- `.forgerc` key `codex_pre_args = ["--sandbox", "danger-full-access"]`
+
 ## Development Commands
 
 ```bash
