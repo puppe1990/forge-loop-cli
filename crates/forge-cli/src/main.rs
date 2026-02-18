@@ -1,8 +1,10 @@
 use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Datelike, Local, TimeZone, Utc};
 use clap::{Parser, Subcommand};
 use forge_config::{load_run_config, CliOverrides, ThinkingMode};
 use forge_core::{read_status, run_loop, ExitReason, RunRequest};
 use forge_monitor::run_monitor;
+use serde_json::Value;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -1094,9 +1096,20 @@ fn status_command(cmd: StatusCommand, cwd: PathBuf) -> Result<()> {
     let cfg = load_run_config(&cwd, &CliOverrides::default())?;
     let runtime_dir = cwd.join(cfg.runtime_dir);
     let status = read_status(&runtime_dir)?;
+    let session_id = infer_session_id(&runtime_dir, &status);
+    let usage = session_id
+        .as_deref()
+        .and_then(read_codex_usage_for_session_id);
 
     if cmd.json {
-        println!("{}", serde_json::to_string_pretty(&status)?);
+        let mut out = serde_json::json!({
+            "status": status,
+            "usage": usage,
+        });
+        if let Some(session_id) = session_id {
+            out["session_id"] = serde_json::json!(session_id);
+        }
+        println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
         let run_timer = if status.run_started_at_epoch == 0 {
             "-".to_string()
@@ -1123,11 +1136,309 @@ fn status_command(cmd: StatusCommand, cwd: PathBuf) -> Result<()> {
         );
         println!(
             "session_id: {}",
-            status.session_id.unwrap_or_else(|| "-".to_string())
+            session_id.unwrap_or_else(|| "-".to_string())
+        );
+        println!("context: {}", format_context_line(usage.as_ref()));
+        println!(
+            "5h limit: {}",
+            format_limit_line(
+                usage.as_ref().and_then(|u| u.five_hour_left_percent),
+                usage
+                    .as_ref()
+                    .and_then(|u| u.five_hour_resets_at.as_deref())
+            )
+        );
+        println!(
+            "7d limit: {}",
+            format_limit_line(
+                usage.as_ref().and_then(|u| u.seven_day_left_percent),
+                usage
+                    .as_ref()
+                    .and_then(|u| u.seven_day_resets_at.as_deref())
+            )
         );
         println!("updated_at_epoch: {}", status.updated_at_epoch);
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct CodexUsageSnapshot {
+    context_left_percent: Option<i64>,
+    context_used_tokens: Option<i64>,
+    context_window_tokens: Option<i64>,
+    five_hour_left_percent: Option<i64>,
+    five_hour_resets_at: Option<String>,
+    seven_day_left_percent: Option<i64>,
+    seven_day_resets_at: Option<String>,
+}
+
+fn infer_session_id(runtime_dir: &Path, status: &forge_types::RunStatus) -> Option<String> {
+    if let Some(session_id) = status.session_id.clone() {
+        if !session_id.trim().is_empty() {
+            return Some(session_id);
+        }
+    }
+
+    let path = runtime_dir.join("live.log");
+    let raw = fs::read_to_string(path).ok()?;
+    for line in raw.lines().rev() {
+        let trimmed = line.trim();
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) == Some("thread.started") {
+            if let Some(thread_id) = value.get("thread_id").and_then(Value::as_str) {
+                if !thread_id.trim().is_empty() {
+                    return Some(thread_id.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn read_codex_usage_for_session_id(session_id: &str) -> Option<CodexUsageSnapshot> {
+    let session_file = if let Some(found) = resolve_codex_session_file(session_id) {
+        found
+    } else {
+        return find_latest_token_count_snapshot();
+    };
+    let raw = fs::read_to_string(session_file).ok()?;
+    let mut latest: Option<CodexUsageSnapshot> = None;
+    for line in raw.lines() {
+        if !line.contains("\"type\":\"token_count\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        if payload.get("type").and_then(Value::as_str) != Some("token_count") {
+            continue;
+        }
+        latest = Some(parse_usage_from_token_count_payload(payload));
+    }
+    latest
+}
+
+fn resolve_codex_session_file(session_id: &str) -> Option<PathBuf> {
+    let mut stack = codex_session_roots();
+    if stack.is_empty() {
+        return None;
+    }
+    while let Some(dir) = stack.pop() {
+        let entries = fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|v| v.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|v| v.to_str())
+                .unwrap_or_default();
+            if name.contains(session_id) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn parse_usage_from_token_count_payload(payload: &Value) -> CodexUsageSnapshot {
+    let context_tokens = payload
+        .get("info")
+        .and_then(|v| v.get("last_token_usage"))
+        .and_then(|v| v.get("total_tokens"))
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            payload
+                .get("info")
+                .and_then(|v| v.get("total_token_usage"))
+                .and_then(|v| v.get("total_tokens"))
+                .and_then(Value::as_i64)
+        });
+    let total_tokens = payload
+        .get("info")
+        .and_then(|v| v.get("total_token_usage"))
+        .and_then(|v| v.get("total_tokens"))
+        .and_then(Value::as_i64);
+    let window_tokens = payload
+        .get("info")
+        .and_then(|v| v.get("model_context_window"))
+        .and_then(Value::as_i64);
+    let context_left_percent = match (context_tokens, window_tokens) {
+        (Some(total), Some(window)) if window > 0 => {
+            Some(100 - ((total as f64 / window as f64) * 100.0).round() as i64)
+        }
+        _ => None,
+    };
+
+    let primary = payload.get("rate_limits").and_then(|v| v.get("primary"));
+    let secondary = payload.get("rate_limits").and_then(|v| v.get("secondary"));
+    let primary_used = primary
+        .and_then(|v| v.get("used_percent"))
+        .and_then(Value::as_f64);
+    let secondary_used = secondary
+        .and_then(|v| v.get("used_percent"))
+        .and_then(Value::as_f64);
+    let primary_resets = primary
+        .and_then(|v| v.get("resets_at"))
+        .and_then(Value::as_i64)
+        .map(format_reset_timestamp);
+    let secondary_resets = secondary
+        .and_then(|v| v.get("resets_at"))
+        .and_then(Value::as_i64)
+        .map(format_reset_timestamp);
+
+    CodexUsageSnapshot {
+        context_left_percent,
+        context_used_tokens: context_tokens.or(total_tokens),
+        context_window_tokens: window_tokens,
+        five_hour_left_percent: primary_used.map(|used| 100 - used.round() as i64),
+        five_hour_resets_at: primary_resets,
+        seven_day_left_percent: secondary_used.map(|used| 100 - used.round() as i64),
+        seven_day_resets_at: secondary_resets,
+    }
+}
+
+fn codex_session_roots() -> Vec<PathBuf> {
+    let Ok(home) = env::var("HOME") else {
+        return Vec::new();
+    };
+    let codex_dir = PathBuf::from(home).join(".codex");
+    vec![
+        codex_dir.join("sessions"),
+        codex_dir.join("archived_sessions"),
+    ]
+}
+
+fn find_latest_token_count_snapshot() -> Option<CodexUsageSnapshot> {
+    let mut newest_path: Option<PathBuf> = None;
+    let mut newest_mtime: Option<SystemTime> = None;
+    let mut stack = codex_session_roots();
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|v| v.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Ok(meta) = fs::metadata(&path) else {
+                continue;
+            };
+            let Ok(mtime) = meta.modified() else {
+                continue;
+            };
+            if newest_mtime.is_none() || Some(mtime) > newest_mtime {
+                newest_mtime = Some(mtime);
+                newest_path = Some(path);
+            }
+        }
+    }
+    let session_file = newest_path?;
+    let raw = fs::read_to_string(session_file).ok()?;
+    let mut latest: Option<CodexUsageSnapshot> = None;
+    for line in raw.lines() {
+        if !line.contains("\"type\":\"token_count\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        if payload.get("type").and_then(Value::as_str) != Some("token_count") {
+            continue;
+        }
+        latest = Some(parse_usage_from_token_count_payload(payload));
+    }
+    latest
+}
+
+fn format_context_line(usage: Option<&CodexUsageSnapshot>) -> String {
+    let Some(usage) = usage else {
+        return "-".to_string();
+    };
+    match (
+        usage.context_left_percent,
+        usage.context_used_tokens,
+        usage.context_window_tokens,
+    ) {
+        (Some(left), Some(used), Some(window)) => {
+            format!(
+                "{}% left ({} used / {})",
+                clamp_percent(left),
+                format_compact_int(used),
+                format_compact_int(window)
+            )
+        }
+        _ => "-".to_string(),
+    }
+}
+
+fn format_limit_line(left_percent: Option<i64>, resets_at: Option<&str>) -> String {
+    let Some(left_percent) = left_percent else {
+        return "-".to_string();
+    };
+    let clamped = clamp_percent(left_percent);
+    let bar = render_limit_bar(clamped as usize, 20);
+    let mut line = format!("{bar} {clamped}% left");
+    if let Some(reset) = resets_at {
+        if !reset.trim().is_empty() {
+            line.push_str(&format!(" (resets {reset})"));
+        }
+    }
+    line
+}
+
+fn clamp_percent(percent: i64) -> i64 {
+    percent.clamp(0, 100)
+}
+
+fn render_limit_bar(left_percent: usize, width: usize) -> String {
+    let filled = ((left_percent.saturating_mul(width) + 50) / 100).min(width);
+    let empty = width.saturating_sub(filled);
+    format!("[{}{}]", "█".repeat(filled), "░".repeat(empty))
+}
+
+fn format_compact_int(value: i64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}K", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+fn format_reset_timestamp(epoch_seconds: i64) -> String {
+    let Some(utc) = Utc.timestamp_opt(epoch_seconds, 0).single() else {
+        return epoch_seconds.to_string();
+    };
+    let local: DateTime<Local> = utc.with_timezone(&Local);
+    let now = Local::now();
+    if local.date_naive() == now.date_naive() {
+        local.format("%-I:%M %p").to_string()
+    } else if local.year() == now.year() {
+        local.format("%b %-d").to_string()
+    } else {
+        local.format("%b %-d, %Y").to_string()
+    }
 }
 
 fn monitor_command(cmd: MonitorCommand, cwd: PathBuf) -> Result<()> {

@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use chrono::Local;
 use forge_config::{ResumeMode, RunConfig};
 use forge_types::{CircuitBreakerState, CircuitState, ProgressSnapshot, RunStatus};
 use serde::de::DeserializeOwned;
@@ -444,15 +445,55 @@ fn build_exec_args(mode: &ResumeMode, cwd: &Path, exec_args: &[String]) -> Vec<S
         }
     };
 
-    let plan_file = cwd.join(".forge/plan.md");
-    if let Ok(plan) = fs::read_to_string(plan_file) {
-        let trimmed = plan.trim();
-        if !trimmed.is_empty() {
-            args.push(trimmed.to_string());
-        }
+    if let Some(plan_prompt) = build_plan_prompt(cwd) {
+        args.push(plan_prompt);
     }
 
     args
+}
+
+fn build_plan_prompt(cwd: &Path) -> Option<String> {
+    let plan_file = cwd.join(".forge/plan.md");
+    let plan = fs::read_to_string(plan_file).ok()?;
+    let trimmed = plan.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let unchecked: Vec<String> = trimmed
+        .lines()
+        .filter(|line| line.contains("- [ ]"))
+        .map(|line| line.trim().to_string())
+        .take(80)
+        .collect();
+
+    let pending_block = if unchecked.is_empty() {
+        "No explicit unchecked checklist items found; continue from current repo state and finalize remaining plan work.".to_string()
+    } else {
+        format!(
+            "Unchecked checklist items (execute only what is still pending):\n{}",
+            unchecked.join("\n")
+        )
+    };
+
+    let last_summary =
+        read_json_or_default::<ProgressSnapshot>(&cwd.join(".forge/progress.json")).last_summary;
+    let continuity = if last_summary.trim().is_empty() {
+        "Last loop summary: (none)".to_string()
+    } else {
+        format!("Last loop summary: {}", last_summary.trim())
+    };
+
+    Some(format!(
+        "You are continuing an iterative execution loop.\n\
+Continue from current workspace state. Do NOT redo completed checklist items.\n\
+Avoid broad scans like `rg --files`; inspect only files needed for the current pending task.\n\
+Apply small, verifiable steps and run only targeted validations per step.\n\
+Emit `EXIT_SIGNAL: true` only when all pending checklist items are complete.\n\n\
+{continuity}\n\n\
+{pending_block}\n\n\
+Plan source: .forge/plan.md"
+    ))
 }
 
 fn build_command_args(config: &RunConfig, cwd: &Path) -> Vec<String> {
@@ -606,8 +647,29 @@ fn append_history(path: &Path, line: &str) -> Result<()> {
         .append(true)
         .open(path)
         .with_context(|| format!("failed to open {}", path.display()))?;
-    file.write_all(line.as_bytes())
+    let stamped = stamp_lines(line);
+    file.write_all(stamped.as_bytes())
         .with_context(|| format!("failed to append {}", path.display()))
+}
+
+fn stamp_lines(input: &str) -> String {
+    let ts = Local::now().format("%H:%M:%S").to_string();
+    let mut out = String::new();
+    for segment in input.split_inclusive('\n') {
+        let has_newline = segment.ends_with('\n');
+        let content = segment.trim_end_matches('\n');
+        if content.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("[{}] {}", ts, content));
+        if has_newline {
+            out.push('\n');
+        }
+    }
+    if out.is_empty() && !input.trim().is_empty() {
+        out.push_str(&format!("[{}] {}", ts, input.trim()));
+    }
+    out
 }
 
 fn epoch_now() -> u64 {
@@ -708,17 +770,27 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let forge_dir = dir.path().join(".forge");
         fs::create_dir_all(&forge_dir).expect("create .forge");
-        fs::write(forge_dir.join("plan.md"), "Refactor architecture in phases")
-            .expect("write plan");
+        fs::write(
+            forge_dir.join("plan.md"),
+            "# Plan\n- [ ] Task A\n- [x] Task B\n",
+        )
+        .expect("write plan");
+        fs::write(
+            forge_dir.join("progress.json"),
+            r#"{"last_summary":"finished task B"}"#,
+        )
+        .expect("write progress");
 
         let args = build_exec_args(&ResumeMode::New, dir.path(), &[]);
 
         assert!(args.contains(&"exec".to_string()));
         assert!(args.contains(&"--json".to_string()));
-        assert_eq!(
-            args.last().expect("last arg"),
-            "Refactor architecture in phases"
-        );
+        let prompt = args.last().expect("last arg");
+        assert!(prompt.contains("continuing an iterative execution loop"));
+        assert!(prompt.contains("Do NOT redo completed checklist items"));
+        assert!(prompt.contains("Task A"));
+        assert!(!prompt.contains("Task B"));
+        assert!(prompt.contains("finished task B"));
     }
 
     #[test]

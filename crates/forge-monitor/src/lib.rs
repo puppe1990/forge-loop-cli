@@ -70,6 +70,7 @@ fn monitor_loop(
     refresh_ms: u64,
     stall_threshold_secs: u64,
 ) -> Result<()> {
+    let mut action_note: Option<String> = None;
     loop {
         let status = read_status(runtime_dir).unwrap_or_else(|_| RunStatus::default());
         let progress = read_progress(runtime_dir);
@@ -85,7 +86,12 @@ fn monitor_loop(
                 ])
                 .split(f.area());
 
-            let top = render_status(&status, runtime_dir, stall_threshold_secs);
+            let top = render_status(
+                &status,
+                runtime_dir,
+                stall_threshold_secs,
+                action_note.as_deref(),
+            );
             let bottom = render_progress(&progress, runtime_dir);
             let plan = render_plan(runtime_dir);
             let activity = render_activity_and_logs(runtime_dir);
@@ -98,8 +104,15 @@ fn monitor_loop(
 
         if event::poll(Duration::from_millis(refresh_ms))? {
             if let Event::Key(key) = event::read()? {
-                if key.code == KeyCode::Char('q') {
-                    break;
+                match key.code {
+                    KeyCode::Char('q') => break,
+                    KeyCode::Char('x') => {
+                        action_note = Some(match stop_runner_process(runtime_dir) {
+                            Ok(msg) => msg,
+                            Err(err) => format!("stop failed: {err}"),
+                        });
+                    }
+                    _ => {}
                 }
             }
         }
@@ -111,6 +124,7 @@ fn render_status(
     status: &RunStatus,
     runtime_dir: &Path,
     stall_threshold_secs: u64,
+    action_note: Option<&str>,
 ) -> Paragraph<'static> {
     let now = epoch_now();
     let run_timer = if status.run_started_at_epoch == 0 {
@@ -141,23 +155,23 @@ fn render_status(
     let mut lines = vec![
         Line::from(format!("state: {}", status.state)),
         Line::from(format!("thinking_mode: {}", status.thinking_mode)),
-        Line::from(format!("run_timer: {}", run_timer)),
+        Line::from(format!(
+            "run_timer: {} | command_timer: {}",
+            run_timer, command_timer
+        )),
         Line::from(format!("current_loop: {}", status.current_loop)),
-        Line::from(format!("command_timer: {}", command_timer)),
-        Line::from(format!("heartbeat_age: {}", heartbeat_age_text)),
-        Line::from(format!("stalled_threshold: {}s", stall_threshold_secs)),
-        Line::from(format!("stalled: {}", stalled)),
-        Line::from(format!("stalled_for: {}", stalled_text)),
         Line::from(format!(
-            "total_loops_executed: {}",
-            status.total_loops_executed
+            "heartbeat_age: {} | stalled: {} ({})",
+            heartbeat_age_text, stalled, stalled_text
         )),
         Line::from(format!(
-            "completion_indicators: {}",
-            status.completion_indicators
+            "total_loops_executed: {} | completion_indicators: {}",
+            status.total_loops_executed, status.completion_indicators
         )),
-        Line::from(format!("exit_signal_seen: {}", status.exit_signal_seen)),
-        Line::from(format!("circuit_state: {:?}", status.circuit_state)),
+        Line::from(format!(
+            "exit_signal_seen: {} | circuit_state: {:?}",
+            status.exit_signal_seen, status.circuit_state
+        )),
         Line::from(format!(
             "session_id: {}",
             session_id.unwrap_or_else(|| "-".to_string())
@@ -181,13 +195,10 @@ fn render_status(
                     .and_then(|u| u.seven_day_resets_at.as_deref())
             )
         )),
-        Line::from(format!(
-            "last_error: {}",
-            status.last_error.clone().unwrap_or_else(|| "-".to_string())
-        )),
-        Line::from(format!("updated_at_epoch: {}", status.updated_at_epoch)),
-        Line::from(""),
     ];
+    if let Some(last_error) = &status.last_error {
+        lines.push(Line::from(format!("last_error: {}", last_error)));
+    }
 
     if runner_dead {
         lines.push(Line::from(vec![Span::styled(
@@ -200,7 +211,13 @@ fn render_status(
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )]));
     }
-    lines.push(Line::from("press 'q' to quit"));
+    if let Some(note) = action_note {
+        lines.push(Line::from(vec![Span::styled(
+            format!("action: {note}"),
+            Style::default().fg(Color::Yellow),
+        )]));
+    }
+    lines.push(Line::from("press 'x' to stop run | 'q' to quit"));
 
     let mut block = Block::default().title("forge status").borders(Borders::ALL);
     if stalled || runner_dead {
@@ -208,6 +225,56 @@ fn render_status(
     }
 
     Paragraph::new(lines).block(block)
+}
+
+fn stop_runner_process(runtime_dir: &Path) -> Result<String> {
+    let pid_path = runtime_dir.join(".runner_pid");
+    let Ok(raw_pid) = fs::read_to_string(&pid_path) else {
+        return Ok("no active runner pid".to_string());
+    };
+    let Ok(pid) = raw_pid.trim().parse::<i32>() else {
+        return Ok("invalid runner pid file".to_string());
+    };
+    if pid <= 0 {
+        return Ok("invalid runner pid value".to_string());
+    }
+
+    #[cfg(unix)]
+    {
+        unsafe {
+            let rc = libc::kill(pid, libc::SIGTERM);
+            if rc != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+                return Ok(format!(
+                    "failed to send SIGTERM to pid {}: {}",
+                    pid,
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+
+        for _ in 0..10 {
+            if is_pid_dead_unix(pid) {
+                let _ = fs::remove_file(&pid_path);
+                return Ok(format!("sent SIGTERM to runner pid {}", pid));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        unsafe {
+            let _ = libc::kill(pid, libc::SIGKILL);
+        }
+        let _ = fs::remove_file(&pid_path);
+        Ok(format!("runner pid {} did not exit; sent SIGKILL", pid))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = fs::remove_file(&pid_path);
+        Ok(format!(
+            "runner stop shortcut is best-effort on this OS (pid {})",
+            pid
+        ))
+    }
 }
 
 fn is_runner_process_dead(runtime_dir: &Path) -> bool {
@@ -345,8 +412,13 @@ fn render_activity_and_logs(runtime_dir: &Path) -> Paragraph<'static> {
         )));
     } else {
         for entry in feed.recent {
+            let time_text = entry.time.unwrap_or_else(|| "--:--:--".to_string());
             lines.push(Line::from(vec![
                 Span::styled("- ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{} ", time_text),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::styled(
                     format!("[{}] ", entry.kind),
                     style_for_event_kind(entry.kind).add_modifier(Modifier::BOLD),
@@ -389,6 +461,7 @@ struct LiveFeed {
 #[derive(Debug)]
 struct LogLine {
     kind: &'static str,
+    time: Option<String>,
     text: String,
 }
 
@@ -446,11 +519,12 @@ fn extract_recent_activity_lines(raw: &str, limit: usize) -> Vec<LogLine> {
         if trimmed.is_empty() || trimmed == "[stdout]" || trimmed == "[stderr]" {
             continue;
         }
-        if is_state_db_discrepancy_warn(trimmed) {
+        let (line_time, normalized_line) = split_log_timestamp(trimmed);
+        if is_state_db_discrepancy_warn(&normalized_line) {
             skipped_state_db_warns += 1;
             continue;
         }
-        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        if let Ok(value) = serde_json::from_str::<Value>(&normalized_line) {
             let Some(parsed) = parse_activity_event(&value) else {
                 continue;
             };
@@ -459,13 +533,15 @@ fn extract_recent_activity_lines(raw: &str, limit: usize) -> Vec<LogLine> {
                 .unwrap_or_else(|| classify_log_event(parsed.text.as_str()));
             out.push(LogLine {
                 kind: label,
+                time: line_time,
                 text: parsed.text,
             });
         } else {
-            let normalized: String = trimmed.chars().take(180).collect();
+            let normalized: String = normalized_line.chars().take(180).collect();
             let label = classify_log_event(&normalized);
             out.push(LogLine {
                 kind: label,
+                time: line_time,
                 text: normalized,
             });
         }
@@ -477,6 +553,7 @@ fn extract_recent_activity_lines(raw: &str, limit: usize) -> Vec<LogLine> {
     if skipped_state_db_warns > 0 {
         out.push(LogLine {
             kind: "SYSTEM",
+            time: None,
             text: format!(
                 "suppressed {} repeated state_db discrepancy warnings",
                 skipped_state_db_warns
@@ -493,26 +570,42 @@ fn extract_latest_activity(raw: &str) -> Option<String> {
         if trimmed.is_empty() || trimmed == "[stdout]" || trimmed == "[stderr]" {
             continue;
         }
-        if is_state_db_discrepancy_warn(trimmed) {
+        let (_, normalized_line) = split_log_timestamp(trimmed);
+        if is_state_db_discrepancy_warn(&normalized_line) {
             continue;
         }
 
-        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        if let Ok(value) = serde_json::from_str::<Value>(&normalized_line) {
             if let Some(parsed) = parse_activity_event(&value) {
                 return Some(parsed.text);
             }
             continue;
         }
 
-        if trimmed.starts_with("202") {
+        if normalized_line.starts_with("202") {
             continue;
         }
 
         if fallback.is_none() {
-            fallback = Some(trimmed.chars().take(180).collect());
+            fallback = Some(normalized_line.chars().take(180).collect());
         }
     }
     fallback
+}
+
+fn split_log_timestamp(line: &str) -> (Option<String>, String) {
+    if let Some(rest) = line.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            let ts = &rest[..end];
+            let is_hms =
+                ts.len() == 8 && ts.chars().nth(2) == Some(':') && ts.chars().nth(5) == Some(':');
+            if is_hms {
+                let content = rest[end + 1..].trim_start().to_string();
+                return (Some(ts.to_string()), content);
+            }
+        }
+    }
+    (None, line.to_string())
 }
 
 fn classify_log_event(line: &str) -> &'static str {
@@ -734,7 +827,11 @@ fn format_compact_int(value: i64) -> String {
 }
 
 fn read_codex_usage_for_session_id(session_id: &str) -> Option<CodexUsageSnapshot> {
-    let session_file = resolve_codex_session_file(session_id)?;
+    let session_file = if let Some(found) = resolve_codex_session_file(session_id) {
+        found
+    } else {
+        return find_latest_token_count_snapshot();
+    };
     let key = session_file.display().to_string();
     let modified_key = file_modified_key(&session_file);
 
@@ -772,8 +869,10 @@ fn resolve_codex_session_file(session_id: &str) -> Option<PathBuf> {
         }
     }
 
-    let base = codex_sessions_base_dir()?;
-    let mut stack = vec![base];
+    let mut stack = codex_session_roots();
+    if stack.is_empty() {
+        return None;
+    }
     let mut resolved: Option<PathBuf> = None;
 
     while let Some(dir) = stack.pop() {
@@ -834,6 +933,18 @@ fn parse_latest_token_count_snapshot(path: &Path) -> Option<CodexUsageSnapshot> 
 }
 
 fn parse_usage_from_token_count_payload(payload: &Value) -> CodexUsageSnapshot {
+    let context_tokens = payload
+        .get("info")
+        .and_then(|v| v.get("last_token_usage"))
+        .and_then(|v| v.get("total_tokens"))
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            payload
+                .get("info")
+                .and_then(|v| v.get("total_token_usage"))
+                .and_then(|v| v.get("total_tokens"))
+                .and_then(Value::as_i64)
+        });
     let total_tokens = payload
         .get("info")
         .and_then(|v| v.get("total_token_usage"))
@@ -843,7 +954,7 @@ fn parse_usage_from_token_count_payload(payload: &Value) -> CodexUsageSnapshot {
         .get("info")
         .and_then(|v| v.get("model_context_window"))
         .and_then(Value::as_i64);
-    let context_left_percent = match (total_tokens, window_tokens) {
+    let context_left_percent = match (context_tokens, window_tokens) {
         (Some(total), Some(window)) if window > 0 => {
             Some(100 - ((total as f64 / window as f64) * 100.0).round() as i64)
         }
@@ -869,7 +980,7 @@ fn parse_usage_from_token_count_payload(payload: &Value) -> CodexUsageSnapshot {
 
     CodexUsageSnapshot {
         context_left_percent,
-        context_used_tokens: total_tokens,
+        context_used_tokens: context_tokens.or(total_tokens),
         context_window_tokens: window_tokens,
         five_hour_left_percent: primary_used.map(|used| 100 - used.round() as i64),
         five_hour_resets_at: primary_resets,
@@ -893,15 +1004,50 @@ fn format_reset_timestamp(epoch_seconds: i64) -> String {
     }
 }
 
-fn codex_sessions_base_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".codex").join("sessions"))
+fn codex_session_roots() -> Vec<PathBuf> {
+    let Ok(home) = std::env::var("HOME") else {
+        return Vec::new();
+    };
+    let codex_dir = PathBuf::from(home).join(".codex");
+    vec![
+        codex_dir.join("sessions"),
+        codex_dir.join("archived_sessions"),
+    ]
 }
 
 fn file_modified_key(path: &Path) -> Option<u128> {
     let modified = fs::metadata(path).ok()?.modified().ok()?;
     let elapsed = modified.duration_since(UNIX_EPOCH).ok()?;
     Some(elapsed.as_nanos())
+}
+
+fn find_latest_token_count_snapshot() -> Option<CodexUsageSnapshot> {
+    let mut newest_path: Option<PathBuf> = None;
+    let mut newest_mtime: Option<u128> = None;
+    let mut stack = codex_session_roots();
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|v| v.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(mtime) = file_modified_key(&path) else {
+                continue;
+            };
+            if newest_mtime.is_none() || Some(mtime) > newest_mtime {
+                newest_mtime = Some(mtime);
+                newest_path = Some(path);
+            }
+        }
+    }
+    newest_path.and_then(|p| parse_latest_token_count_snapshot(&p))
 }
 
 #[cfg(test)]
