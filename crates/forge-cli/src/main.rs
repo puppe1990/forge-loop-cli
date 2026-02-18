@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use forge_config::{load_run_config, CliOverrides};
 use forge_core::{read_status, run_loop, ExitReason, RunRequest};
 use forge_monitor::run_monitor;
+use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -16,6 +17,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
     after_help = "Without subcommands, forge starts interactive assistant mode."
 )]
 struct Cli {
+    #[arg(long, global = true)]
+    cwd: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -76,22 +80,21 @@ struct SddInterview {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let cwd = resolve_cwd(cli.cwd)?;
 
     match cli.command {
-        Some(Commands::Run(cmd)) => run_command(cmd),
-        Some(Commands::Status(cmd)) => status_command(cmd),
-        Some(Commands::Monitor(cmd)) => monitor_command(cmd),
-        None => assistant_mode(),
+        Some(Commands::Run(cmd)) => run_command(cmd, cwd),
+        Some(Commands::Status(cmd)) => status_command(cmd, cwd),
+        Some(Commands::Monitor(cmd)) => monitor_command(cmd, cwd),
+        None => assistant_mode(cwd),
     }
 }
 
-fn assistant_mode() -> Result<()> {
+fn assistant_mode(cwd: PathBuf) -> Result<()> {
     println!("forge assistant mode");
     println!("answer the SDD questions. forge will generate specs and run the loop.\n");
 
     let answers = collect_sdd_answers()?;
-    let cwd = std::env::current_dir()?;
-
     write_sdd_outputs(&cwd, &answers)?;
 
     println!("\nGenerated:");
@@ -101,14 +104,17 @@ fn assistant_mode() -> Result<()> {
     println!("- docs/specs/session/scenarios.md");
     println!("\nstarting loop...\n");
 
-    run_command(RunCommand {
-        resume: None,
-        resume_last: false,
-        max_calls_per_hour: None,
-        timeout_minutes: None,
-        json: false,
-        max_loops: answers.max_loops,
-    })
+    run_command(
+        RunCommand {
+            resume: None,
+            resume_last: false,
+            max_calls_per_hour: None,
+            timeout_minutes: None,
+            json: false,
+            max_loops: answers.max_loops,
+        },
+        cwd,
+    )
 }
 
 fn collect_sdd_answers() -> Result<SddInterview> {
@@ -249,8 +255,7 @@ fn render_plan(a: &SddInterview) -> String {
     )
 }
 
-fn run_command(cmd: RunCommand) -> Result<()> {
-    let cwd = std::env::current_dir()?;
+fn run_command(cmd: RunCommand, cwd: PathBuf) -> Result<()> {
     let cfg = load_run_config(
         &cwd,
         &CliOverrides {
@@ -291,8 +296,7 @@ fn run_command(cmd: RunCommand) -> Result<()> {
     });
 }
 
-fn status_command(cmd: StatusCommand) -> Result<()> {
-    let cwd = std::env::current_dir()?;
+fn status_command(cmd: StatusCommand, cwd: PathBuf) -> Result<()> {
     let cfg = load_run_config(&cwd, &CliOverrides::default())?;
     let runtime_dir = cwd.join(cfg.runtime_dir);
     let status = read_status(&runtime_dir)?;
@@ -314,9 +318,16 @@ fn status_command(cmd: StatusCommand) -> Result<()> {
     Ok(())
 }
 
-fn monitor_command(cmd: MonitorCommand) -> Result<()> {
-    let cwd = std::env::current_dir()?;
+fn monitor_command(cmd: MonitorCommand, cwd: PathBuf) -> Result<()> {
     let cfg = load_run_config(&cwd, &CliOverrides::default())?;
     let runtime_dir: PathBuf = cwd.join(cfg.runtime_dir);
     run_monitor(&runtime_dir, cmd.refresh_ms)
+}
+
+fn resolve_cwd(cwd: Option<PathBuf>) -> Result<PathBuf> {
+    let path = match cwd {
+        Some(p) => p,
+        None => env::current_dir()?,
+    };
+    Ok(path.canonicalize()?)
 }

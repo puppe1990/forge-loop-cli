@@ -11,6 +11,7 @@ fn help_shows_subcommands() {
     cmd.arg("--help")
         .assert()
         .success()
+        .stdout(contains("--cwd"))
         .stdout(contains("interactive assistant mode"))
         .stdout(contains("run"))
         .stdout(contains("status"))

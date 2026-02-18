@@ -81,6 +81,12 @@ cargo run -p forge
 
 This starts the interactive SDD assistant, generates specs/plan files, and then executes the loop with Codex CLI.
 
+To run against a different folder without changing directories:
+
+```bash
+cargo run -p forge -- --cwd /absolute/path/to/project
+```
+
 ## License
 
 MIT. See `LICENSE`.
