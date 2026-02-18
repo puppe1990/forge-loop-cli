@@ -57,6 +57,12 @@ Expected files in `.forge/`:
 
 Agents must preserve these contracts unless a migration is explicitly implemented.
 
+Status semantics:
+
+- `run_started_at_epoch`: start of current `forge run`
+- `current_loop_started_at_epoch`: start of current loop command
+- `last_heartbeat_at_epoch`: last real output/stream heartbeat from Codex process
+
 ## Config Precedence
 
 Always preserve precedence:
@@ -69,7 +75,12 @@ Always preserve precedence:
 Codex runtime global flags can be passed via:
 
 - `forge run --codex-arg=<value>` (repeatable)
+- `forge run --full-access` (forces `--sandbox danger-full-access`)
 - `.forgerc` key `codex_pre_args = ["--sandbox", "danger-full-access"]`
+
+Monitor tuning:
+
+- `forge monitor --stall-threshold-secs <N>` controls stale heartbeat alert threshold
 
 ## Development Commands
 

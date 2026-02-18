@@ -24,10 +24,10 @@ codex --version
 ## Commands
 
 - `forge` (interactive assistant mode: asks SDD questions, writes plan/specs, then runs loop)
-- `forge run`
+- `forge run [--full-access] [--thinking off|summary|raw] [--max-loops N] [--timeout-minutes N]`
 - `forge analyze --modified-only`
 - `forge status`
-- `forge monitor`
+- `forge monitor [--refresh-ms N] [--stall-threshold-secs N]`
 - `forge sdd list`
 - `forge sdd load <id>`
 
@@ -85,13 +85,19 @@ The runtime state is stored in `.forge/`:
 `forge monitor` now shows, in real time:
 
 - current loop
-- loop timer (`HH:MM:SS`)
+- run timer and current command timer (`HH:MM:SS`)
 - current Codex activity extracted from `.forge/live.log`
 - stalled detection based on heartbeat (`last_heartbeat_at_epoch`)
+- alert when heartbeat is stale (red status panel border and alert line)
+- suppressed noise for repeated `codex_core::state_db record_discrepancy` warnings
 
-`forge status` also prints `loop_timer`.
+`forge status` prints `run_timer` and `command_timer`.
 
-`forge run` now updates a heartbeat (`last_heartbeat_at_epoch`) while a loop iteration is in progress.
+`forge run` updates heartbeat (`last_heartbeat_at_epoch`) from real stream events during loop execution.
+
+### Monitor screenshot
+
+![Forge monitor live view](docs/assets/forge-monitor-live.png)
 
 ## Config precedence
 
@@ -138,12 +144,24 @@ forge --cwd /absolute/path/to/project run \
   --codex-arg=danger-full-access
 ```
 
+Shortcut for full sandbox permissions:
+
+```bash
+forge --cwd /absolute/path/to/project run --full-access
+```
+
 Control thinking verbosity presets (mapped to Codex `--config` flags):
 
 ```bash
 forge --cwd /absolute/path/to/project run --thinking off
 forge --cwd /absolute/path/to/project run --thinking summary
 forge --cwd /absolute/path/to/project run --thinking raw
+```
+
+Monitor with a custom stall threshold:
+
+```bash
+forge --cwd /absolute/path/to/project monitor --stall-threshold-secs 20
 ```
 
 You can also persist these args in `.forgerc`:
