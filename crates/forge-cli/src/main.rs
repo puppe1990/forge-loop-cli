@@ -644,13 +644,15 @@ fn analyze_command(cmd: AnalyzeCommand, cwd: PathBuf) -> Result<()> {
 
     let persisted = persist_analyze_report(
         &cwd,
-        &files,
-        chunks.len(),
-        chunk_size,
-        timed_out_chunks,
-        failed_chunks,
-        &chunk_reports,
-        &report,
+        AnalyzePersistInput {
+            files: &files,
+            chunks: chunks.len(),
+            chunk_size,
+            timed_out_chunks,
+            failed_chunks,
+            chunk_reports: &chunk_reports,
+            report: &report,
+        },
     )?;
 
     if cmd.json {
@@ -741,16 +743,18 @@ fn analyze_resume_latest(
 
     let persisted = persist_analyze_report(
         &cwd,
-        &files,
-        chunk_reports.len(),
-        latest
-            .get("chunk_size")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize,
-        if synthesis.timed_out { 1 } else { 0 },
-        if synthesis.exit_code == Some(0) { 0 } else { 1 },
-        &chunk_reports,
-        &report,
+        AnalyzePersistInput {
+            files: &files,
+            chunks: chunk_reports.len(),
+            chunk_size: latest
+                .get("chunk_size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize,
+            timed_out_chunks: if synthesis.timed_out { 1 } else { 0 },
+            failed_chunks: if synthesis.exit_code == Some(0) { 0 } else { 1 },
+            chunk_reports: &chunk_reports,
+            report: &report,
+        },
     )?;
 
     if cmd.json {
@@ -844,15 +848,19 @@ struct AnalyzePersistPaths {
     history_path: String,
 }
 
-fn persist_analyze_report(
-    cwd: &Path,
-    files: &[String],
+struct AnalyzePersistInput<'a> {
+    files: &'a [String],
     chunks: usize,
     chunk_size: usize,
     timed_out_chunks: u64,
     failed_chunks: u64,
-    chunk_reports: &[String],
-    report: &str,
+    chunk_reports: &'a [String],
+    report: &'a str,
+}
+
+fn persist_analyze_report(
+    cwd: &Path,
+    input: AnalyzePersistInput<'_>,
 ) -> Result<AnalyzePersistPaths> {
     let analyze_dir = cwd.join(".forge").join("analyze");
     let history_dir = analyze_dir.join("history");
@@ -862,14 +870,14 @@ fn persist_analyze_report(
     let now = epoch_now();
     let payload = serde_json::json!({
         "created_at_epoch": now,
-        "modified_files": files.len(),
-        "chunks": chunks,
-        "chunk_size": chunk_size,
-        "timed_out_chunks": timed_out_chunks,
-        "failed_chunks": failed_chunks,
-        "files": files,
-        "chunk_reports": chunk_reports,
-        "report": report,
+        "modified_files": input.files.len(),
+        "chunks": input.chunks,
+        "chunk_size": input.chunk_size,
+        "timed_out_chunks": input.timed_out_chunks,
+        "failed_chunks": input.failed_chunks,
+        "files": input.files,
+        "chunk_reports": input.chunk_reports,
+        "report": input.report,
     });
 
     let latest_path = analyze_dir.join("latest.json");
