@@ -11,3 +11,5 @@ ratatui.workspace = true
 forge-core = { path = "../forge-core" }
 forge-types = { path = "../forge-types" }
 serde_json.workspace = true
+libc.workspace = true
+chrono.workspace = true

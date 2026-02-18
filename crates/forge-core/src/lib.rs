@@ -6,10 +6,13 @@ use serde_json::Value;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::process;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const NO_OUTPUT_WATCHDOG_SECS: u64 = 120;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitReason {
@@ -46,18 +49,34 @@ pub fn run_loop(req: RunRequest) -> Result<RunOutcome> {
     let runtime_dir = req.cwd.join(&req.config.runtime_dir);
     fs::create_dir_all(&runtime_dir)
         .with_context(|| format!("failed to create {}", runtime_dir.display()))?;
+    let _runner_pid_guard = RunnerPidGuard::create(&runtime_dir)?;
 
-    let mut status: RunStatus = read_json_or_default(&runtime_dir.join("status.json"));
-    let mut progress: ProgressSnapshot = read_json_or_default(&runtime_dir.join("progress.json"));
-    let mut circuit: CircuitBreakerState =
-        read_json_or_default(&runtime_dir.join(".circuit_breaker_state"));
+    let previous_status: RunStatus = read_json_or_default(&runtime_dir.join("status.json"));
+    let mut status = RunStatus {
+        state: "running".to_string(),
+        thinking_mode: req.config.thinking_mode.as_str().to_string(),
+        run_started_at_epoch: epoch_now(),
+        current_loop: 0,
+        total_loops_executed: 0,
+        last_error: None,
+        completion_indicators: 0,
+        exit_signal_seen: false,
+        session_id: previous_status.session_id,
+        circuit_state: CircuitState::Closed,
+        current_loop_started_at_epoch: 0,
+        last_heartbeat_at_epoch: 0,
+        updated_at_epoch: epoch_now(),
+    };
+    let mut progress = ProgressSnapshot {
+        updated_at_epoch: epoch_now(),
+        ..ProgressSnapshot::default()
+    };
+    let mut circuit = CircuitBreakerState::default();
 
-    status.state = "running".to_string();
-    status.thinking_mode = req.config.thinking_mode.as_str().to_string();
-    status.run_started_at_epoch = epoch_now();
-    status.updated_at_epoch = epoch_now();
     status.circuit_state = circuit.state.clone();
     write_json(&runtime_dir.join("status.json"), &status)?;
+    write_json(&runtime_dir.join("progress.json"), &progress)?;
+    write_json(&runtime_dir.join(".circuit_breaker_state"), &circuit)?;
 
     let mut loop_count = 0_u64;
 
@@ -77,8 +96,7 @@ pub fn run_loop(req: RunRequest) -> Result<RunOutcome> {
 
         let rate = check_and_increment_call_count(&runtime_dir, req.config.max_calls_per_hour)?;
         if !rate.allowed {
-            status.state = "rate_limited".to_string();
-            status.updated_at_epoch = epoch_now();
+            finalize_run_status(&mut status, "rate_limited");
             write_json(&runtime_dir.join("status.json"), &status)?;
             if req.config.auto_wait_on_rate_limit {
                 std::thread::sleep(Duration::from_secs(req.config.sleep_on_rate_limit_secs));
@@ -172,8 +190,7 @@ pub fn run_loop(req: RunRequest) -> Result<RunOutcome> {
         )?;
 
         if analysis.exit_signal_true && analysis.completion_indicators > 0 {
-            status.state = "completed".to_string();
-            status.updated_at_epoch = epoch_now();
+            finalize_run_status(&mut status, "completed");
             write_json(&runtime_dir.join("status.json"), &status)?;
             return Ok(RunOutcome {
                 reason: ExitReason::Completed,
@@ -183,8 +200,7 @@ pub fn run_loop(req: RunRequest) -> Result<RunOutcome> {
         }
 
         if matches!(circuit.state, CircuitState::Open) {
-            status.state = "circuit_open".to_string();
-            status.updated_at_epoch = epoch_now();
+            finalize_run_status(&mut status, "circuit_open");
             write_json(&runtime_dir.join("status.json"), &status)?;
             return Ok(RunOutcome {
                 reason: ExitReason::CircuitOpened,
@@ -194,8 +210,7 @@ pub fn run_loop(req: RunRequest) -> Result<RunOutcome> {
         }
     }
 
-    status.state = "max_loops_reached".to_string();
-    status.updated_at_epoch = epoch_now();
+    finalize_run_status(&mut status, "max_loops_reached");
     write_json(&runtime_dir.join("status.json"), &status)?;
 
     Ok(RunOutcome {
@@ -203,6 +218,33 @@ pub fn run_loop(req: RunRequest) -> Result<RunOutcome> {
         loops_executed: loop_count,
         status,
     })
+}
+
+struct RunnerPidGuard {
+    path: PathBuf,
+}
+
+impl RunnerPidGuard {
+    fn create(runtime_dir: &Path) -> Result<Self> {
+        let path = runtime_dir.join(".runner_pid");
+        fs::write(&path, process::id().to_string())
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for RunnerPidGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn finalize_run_status(status: &mut RunStatus, state: &str) {
+    status.state = state.to_string();
+    status.current_loop = 0;
+    status.current_loop_started_at_epoch = 0;
+    status.last_heartbeat_at_epoch = 0;
+    status.updated_at_epoch = epoch_now();
 }
 
 fn execute_iteration<F>(
@@ -221,6 +263,13 @@ where
         Some(Duration::from_secs(
             config.timeout_minutes.saturating_mul(60),
         ))
+    };
+    // If the user disables timeouts (`--timeout-minutes 0`), do not apply a no-output watchdog.
+    // This matches the expectation that long-running commands can proceed without forced kills.
+    let no_output_watchdog = if config.timeout_minutes == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(NO_OUTPUT_WATCHDOG_SECS))
     };
     let mut child = Command::new(&config.codex_cmd)
         .args(&args)
@@ -250,11 +299,13 @@ where
     let mut open_streams = 2_u8;
     let mut stdout_buf = String::new();
     let mut stderr_buf = String::new();
+    let mut last_output_at = Instant::now();
 
     loop {
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(StreamEvent::Chunk { source, chunk }) => {
                 heartbeat()?;
+                last_output_at = Instant::now();
                 match source {
                     StreamSource::Stdout => {
                         stdout_buf.push_str(&chunk);
@@ -270,8 +321,12 @@ where
                 heartbeat()?;
                 open_streams = open_streams.saturating_sub(1);
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Keep heartbeat moving even when codex is busy and not producing output.
+                heartbeat()?;
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                heartbeat()?;
                 open_streams = 0;
             }
         }
@@ -289,6 +344,23 @@ where
                         .with_context(|| format!("failed waiting for {}", config.codex_cmd))?;
                     finished = true;
                     exit_ok = status.success();
+                }
+            } else if let Some(limit) = no_output_watchdog {
+                if last_output_at.elapsed() >= limit {
+                    timed_out = true;
+                    let _ = child.kill();
+                    let status = child
+                        .wait()
+                        .with_context(|| format!("failed waiting for {}", config.codex_cmd))?;
+                    finished = true;
+                    exit_ok = status.success();
+                    append_history(
+                        live_log_path,
+                        &format!(
+                            "[forge] no output watchdog triggered after {}s; iteration killed\n",
+                            limit.as_secs()
+                        ),
+                    )?;
                 }
             }
         }
@@ -552,7 +624,56 @@ pub fn read_status(runtime_dir: &Path) -> Result<RunStatus> {
     }
     let body =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&body).with_context(|| format!("invalid json in {}", path.display()))
+    let mut status: RunStatus = serde_json::from_str(&body)
+        .with_context(|| format!("invalid json in {}", path.display()))?;
+    if is_stale_running_status(runtime_dir, &status) {
+        status.state = "stale_runner".to_string();
+        status.current_loop = 0;
+        status.current_loop_started_at_epoch = 0;
+        status.last_heartbeat_at_epoch = 0;
+        if status.last_error.is_none() {
+            status.last_error = Some("runner process not found".to_string());
+        }
+        status.updated_at_epoch = epoch_now();
+        let _ = write_json(&path, &status);
+        let _ = fs::remove_file(runtime_dir.join(".runner_pid"));
+    }
+    Ok(status)
+}
+
+fn is_stale_running_status(runtime_dir: &Path, status: &RunStatus) -> bool {
+    if status.state != "running" {
+        return false;
+    }
+    let pid_path = runtime_dir.join(".runner_pid");
+    let Ok(raw_pid) = fs::read_to_string(pid_path) else {
+        return true;
+    };
+    let Ok(pid) = raw_pid.trim().parse::<i32>() else {
+        return true;
+    };
+    if pid <= 0 {
+        return true;
+    }
+    !is_pid_alive(pid)
+}
+
+#[cfg(unix)]
+fn is_pid_alive(pid: i32) -> bool {
+    unsafe {
+        let rc = libc::kill(pid, 0);
+        if rc == 0 {
+            true
+        } else {
+            // EPERM means process exists but we lack permission.
+            std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn is_pid_alive(_pid: i32) -> bool {
+    true
 }
 
 pub fn read_progress(runtime_dir: &Path) -> ProgressSnapshot {
@@ -670,5 +791,26 @@ mod tests {
         assert_eq!(args[2], "exec");
         assert_eq!(args[3], "--ephemeral");
         assert_eq!(args[4], "--json");
+    }
+
+    #[test]
+    fn read_status_marks_stale_runner_when_pid_missing() {
+        let dir = tempdir().expect("tempdir");
+        let runtime = dir.path().join(".forge");
+        fs::create_dir_all(&runtime).expect("create runtime");
+
+        let status = RunStatus {
+            state: "running".to_string(),
+            current_loop: 1,
+            current_loop_started_at_epoch: 10,
+            last_heartbeat_at_epoch: 10,
+            ..RunStatus::default()
+        };
+        write_json(&runtime.join("status.json"), &status).expect("write status");
+
+        let observed = read_status(&runtime).expect("read status");
+        assert_eq!(observed.state, "stale_runner");
+        assert_eq!(observed.current_loop, 0);
+        assert_eq!(observed.current_loop_started_at_epoch, 0);
     }
 }

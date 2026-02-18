@@ -54,6 +54,7 @@ Expected files in `.forge/`:
 - `.last_reset`
 - `.circuit_breaker_state`
 - `.circuit_breaker_history`
+- `.runner_pid`
 
 Agents must preserve these contracts unless a migration is explicitly implemented.
 
@@ -62,6 +63,7 @@ Status semantics:
 - `run_started_at_epoch`: start of current `forge run`
 - `current_loop_started_at_epoch`: start of current loop command
 - `last_heartbeat_at_epoch`: last real output/stream heartbeat from Codex process
+- `.runner_pid`: PID of active forge run process (used by monitor to detect stale `running` state)
 
 ## Config Precedence
 

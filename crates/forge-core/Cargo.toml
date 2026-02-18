@@ -10,6 +10,7 @@ serde.workspace = true
 serde_json.workspace = true
 forge-config = { path = "../forge-config" }
 forge-types = { path = "../forge-types" }
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

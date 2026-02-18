@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::{DateTime, Datelike, Local, TimeZone, Utc};
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -13,12 +14,38 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs;
+use std::fs::File;
+use std::io::BufRead;
+use std::io::BufReader;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_STALL_THRESHOLD_SECS: u64 = 15;
+const LIMIT_BAR_WIDTH: usize = 20;
+
+static SESSION_PATH_CACHE: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
+static SESSION_USAGE_CACHE: OnceLock<Mutex<HashMap<String, CachedSessionUsage>>> = OnceLock::new();
+
+#[derive(Debug, Clone)]
+struct CodexUsageSnapshot {
+    context_left_percent: Option<i64>,
+    context_used_tokens: Option<i64>,
+    context_window_tokens: Option<i64>,
+    five_hour_left_percent: Option<i64>,
+    five_hour_resets_at: Option<String>,
+    seven_day_left_percent: Option<i64>,
+    seven_day_resets_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedSessionUsage {
+    modified_key: Option<u128>,
+    snapshot: Option<CodexUsageSnapshot>,
+}
 
 pub fn run_monitor(runtime_dir: &Path, refresh_ms: u64, stall_threshold_secs: u64) -> Result<()> {
     enable_raw_mode()?;
@@ -58,7 +85,7 @@ fn monitor_loop(
                 ])
                 .split(f.area());
 
-            let top = render_status(&status, stall_threshold_secs);
+            let top = render_status(&status, runtime_dir, stall_threshold_secs);
             let bottom = render_progress(&progress, runtime_dir);
             let plan = render_plan(runtime_dir);
             let activity = render_activity_and_logs(runtime_dir);
@@ -80,7 +107,11 @@ fn monitor_loop(
     Ok(())
 }
 
-fn render_status(status: &RunStatus, stall_threshold_secs: u64) -> Paragraph<'static> {
+fn render_status(
+    status: &RunStatus,
+    runtime_dir: &Path,
+    stall_threshold_secs: u64,
+) -> Paragraph<'static> {
     let now = epoch_now();
     let run_timer = if status.run_started_at_epoch == 0 {
         "-".to_string()
@@ -94,6 +125,7 @@ fn render_status(status: &RunStatus, stall_threshold_secs: u64) -> Paragraph<'st
     };
     let stalled_for = stalled_for_secs(status, now, stall_threshold_secs);
     let stalled = stalled_for.is_some();
+    let runner_dead = is_runner_process_dead(runtime_dir);
     let heartbeat_age = heartbeat_age_secs(status, now);
     let heartbeat_age_text = heartbeat_age
         .map(format_elapsed)
@@ -101,6 +133,10 @@ fn render_status(status: &RunStatus, stall_threshold_secs: u64) -> Paragraph<'st
     let stalled_text = stalled_for
         .map(format_elapsed)
         .unwrap_or_else(|| "-".to_string());
+    let session_id = infer_session_id(runtime_dir, status);
+    let usage = session_id
+        .as_deref()
+        .and_then(read_codex_usage_for_session_id);
 
     let mut lines = vec![
         Line::from(format!("state: {}", status.state)),
@@ -124,7 +160,26 @@ fn render_status(status: &RunStatus, stall_threshold_secs: u64) -> Paragraph<'st
         Line::from(format!("circuit_state: {:?}", status.circuit_state)),
         Line::from(format!(
             "session_id: {}",
-            status.session_id.clone().unwrap_or_else(|| "-".to_string())
+            session_id.unwrap_or_else(|| "-".to_string())
+        )),
+        Line::from(format!("context: {}", format_context_line(usage.as_ref()))),
+        Line::from(format!(
+            "5h limit: {}",
+            format_limit_line(
+                usage.as_ref().and_then(|u| u.five_hour_left_percent),
+                usage
+                    .as_ref()
+                    .and_then(|u| u.five_hour_resets_at.as_deref())
+            )
+        )),
+        Line::from(format!(
+            "7d limit: {}",
+            format_limit_line(
+                usage.as_ref().and_then(|u| u.seven_day_left_percent),
+                usage
+                    .as_ref()
+                    .and_then(|u| u.seven_day_resets_at.as_deref())
+            )
         )),
         Line::from(format!(
             "last_error: {}",
@@ -134,7 +189,12 @@ fn render_status(status: &RunStatus, stall_threshold_secs: u64) -> Paragraph<'st
         Line::from(""),
     ];
 
-    if stalled {
+    if runner_dead {
+        lines.push(Line::from(vec![Span::styled(
+            "ALERT: runner process not found (stale status).",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )]));
+    } else if stalled {
         lines.push(Line::from(vec![Span::styled(
             "ALERT: heartbeat stale (no recent events).",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -143,11 +203,49 @@ fn render_status(status: &RunStatus, stall_threshold_secs: u64) -> Paragraph<'st
     lines.push(Line::from("press 'q' to quit"));
 
     let mut block = Block::default().title("forge status").borders(Borders::ALL);
-    if stalled {
+    if stalled || runner_dead {
         block = block.border_style(Style::default().fg(Color::Red));
     }
 
     Paragraph::new(lines).block(block)
+}
+
+fn is_runner_process_dead(runtime_dir: &Path) -> bool {
+    if !runtime_dir.join("status.json").exists() {
+        return false;
+    }
+    let status = read_status(runtime_dir).unwrap_or_default();
+    if status.state != "running" {
+        return false;
+    }
+    let pid_path = runtime_dir.join(".runner_pid");
+    let Ok(raw_pid) = fs::read_to_string(pid_path) else {
+        return true;
+    };
+    let Ok(pid) = raw_pid.trim().parse::<i32>() else {
+        return true;
+    };
+    if pid <= 0 {
+        return true;
+    }
+    is_pid_dead_unix(pid)
+}
+
+#[cfg(unix)]
+fn is_pid_dead_unix(pid: i32) -> bool {
+    unsafe {
+        let rc = libc::kill(pid, 0);
+        if rc == 0 {
+            false
+        } else {
+            std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn is_pid_dead_unix(_pid: i32) -> bool {
+    false
 }
 
 fn heartbeat_age_secs(status: &RunStatus, now: u64) -> Option<u64> {
@@ -552,6 +650,258 @@ fn format_elapsed(total_secs: u64) -> String {
     let minutes = (total_secs % 3600) / 60;
     let seconds = total_secs % 60;
     format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
+fn infer_session_id(runtime_dir: &Path, status: &RunStatus) -> Option<String> {
+    if let Some(session_id) = status.session_id.clone() {
+        if !session_id.trim().is_empty() {
+            return Some(session_id);
+        }
+    }
+
+    let path = resolve_log_source(runtime_dir)?;
+    let raw = fs::read_to_string(path).ok()?;
+    for line in raw.lines().rev() {
+        let trimmed = line.trim();
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) == Some("thread.started") {
+            if let Some(thread_id) = value.get("thread_id").and_then(Value::as_str) {
+                if !thread_id.trim().is_empty() {
+                    return Some(thread_id.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn format_context_line(usage: Option<&CodexUsageSnapshot>) -> String {
+    let Some(usage) = usage else {
+        return "-".to_string();
+    };
+    match (
+        usage.context_left_percent,
+        usage.context_used_tokens,
+        usage.context_window_tokens,
+    ) {
+        (Some(left), Some(used), Some(window)) => {
+            format!(
+                "{}% left ({} used / {})",
+                clamp_percent(left),
+                format_compact_int(used),
+                format_compact_int(window)
+            )
+        }
+        _ => "-".to_string(),
+    }
+}
+
+fn format_limit_line(left_percent: Option<i64>, resets_at: Option<&str>) -> String {
+    let Some(left_percent) = left_percent else {
+        return "-".to_string();
+    };
+    let clamped = clamp_percent(left_percent);
+    let bar = render_limit_bar(clamped as usize, LIMIT_BAR_WIDTH);
+    let mut line = format!("{bar} {clamped}% left");
+    if let Some(reset) = resets_at {
+        if !reset.trim().is_empty() {
+            line.push_str(&format!(" (resets {reset})"));
+        }
+    }
+    line
+}
+
+fn clamp_percent(percent: i64) -> i64 {
+    percent.clamp(0, 100)
+}
+
+fn render_limit_bar(left_percent: usize, width: usize) -> String {
+    let filled = ((left_percent.saturating_mul(width) + 50) / 100).min(width);
+    let empty = width.saturating_sub(filled);
+    format!("[{}{}]", "█".repeat(filled), "░".repeat(empty))
+}
+
+fn format_compact_int(value: i64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}K", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+fn read_codex_usage_for_session_id(session_id: &str) -> Option<CodexUsageSnapshot> {
+    let session_file = resolve_codex_session_file(session_id)?;
+    let key = session_file.display().to_string();
+    let modified_key = file_modified_key(&session_file);
+
+    let usage_cache = SESSION_USAGE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(cache) = usage_cache.lock() {
+        if let Some(cached) = cache.get(&key) {
+            if cached.modified_key == modified_key {
+                return cached.snapshot.clone();
+            }
+        }
+    }
+
+    let snapshot = parse_latest_token_count_snapshot(&session_file);
+
+    if let Ok(mut cache) = usage_cache.lock() {
+        cache.insert(
+            key,
+            CachedSessionUsage {
+                modified_key,
+                snapshot: snapshot.clone(),
+            },
+        );
+    }
+
+    snapshot
+}
+
+fn resolve_codex_session_file(session_id: &str) -> Option<PathBuf> {
+    let path_cache = SESSION_PATH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(cache) = path_cache.lock() {
+        if let Some(path) = cache.get(session_id) {
+            if path.exists() {
+                return Some(path.clone());
+            }
+        }
+    }
+
+    let base = codex_sessions_base_dir()?;
+    let mut stack = vec![base];
+    let mut resolved: Option<PathBuf> = None;
+
+    while let Some(dir) = stack.pop() {
+        let entries = fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|v| v.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|v| v.to_str())
+                .unwrap_or_default();
+            if name.contains(session_id) {
+                resolved = Some(path);
+                break;
+            }
+        }
+        if resolved.is_some() {
+            break;
+        }
+    }
+
+    if let Some(path) = resolved.clone() {
+        if let Ok(mut cache) = path_cache.lock() {
+            cache.insert(session_id.to_string(), path);
+        }
+    }
+    resolved
+}
+
+fn parse_latest_token_count_snapshot(path: &Path) -> Option<CodexUsageSnapshot> {
+    let file = File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    let mut latest: Option<CodexUsageSnapshot> = None;
+
+    for line in reader.lines().map_while(std::result::Result::ok) {
+        if !line.contains("\"type\":\"token_count\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        if payload.get("type").and_then(Value::as_str) != Some("token_count") {
+            continue;
+        }
+        latest = Some(parse_usage_from_token_count_payload(payload));
+    }
+
+    latest
+}
+
+fn parse_usage_from_token_count_payload(payload: &Value) -> CodexUsageSnapshot {
+    let total_tokens = payload
+        .get("info")
+        .and_then(|v| v.get("total_token_usage"))
+        .and_then(|v| v.get("total_tokens"))
+        .and_then(Value::as_i64);
+    let window_tokens = payload
+        .get("info")
+        .and_then(|v| v.get("model_context_window"))
+        .and_then(Value::as_i64);
+    let context_left_percent = match (total_tokens, window_tokens) {
+        (Some(total), Some(window)) if window > 0 => {
+            Some(100 - ((total as f64 / window as f64) * 100.0).round() as i64)
+        }
+        _ => None,
+    };
+
+    let primary = payload.get("rate_limits").and_then(|v| v.get("primary"));
+    let secondary = payload.get("rate_limits").and_then(|v| v.get("secondary"));
+    let primary_used = primary
+        .and_then(|v| v.get("used_percent"))
+        .and_then(Value::as_f64);
+    let secondary_used = secondary
+        .and_then(|v| v.get("used_percent"))
+        .and_then(Value::as_f64);
+    let primary_resets = primary
+        .and_then(|v| v.get("resets_at"))
+        .and_then(Value::as_i64)
+        .map(format_reset_timestamp);
+    let secondary_resets = secondary
+        .and_then(|v| v.get("resets_at"))
+        .and_then(Value::as_i64)
+        .map(format_reset_timestamp);
+
+    CodexUsageSnapshot {
+        context_left_percent,
+        context_used_tokens: total_tokens,
+        context_window_tokens: window_tokens,
+        five_hour_left_percent: primary_used.map(|used| 100 - used.round() as i64),
+        five_hour_resets_at: primary_resets,
+        seven_day_left_percent: secondary_used.map(|used| 100 - used.round() as i64),
+        seven_day_resets_at: secondary_resets,
+    }
+}
+
+fn format_reset_timestamp(epoch_seconds: i64) -> String {
+    let Some(utc) = Utc.timestamp_opt(epoch_seconds, 0).single() else {
+        return epoch_seconds.to_string();
+    };
+    let local: DateTime<Local> = utc.with_timezone(&Local);
+    let now = Local::now();
+    if local.date_naive() == now.date_naive() {
+        local.format("%-I:%M %p").to_string()
+    } else if local.year() == now.year() {
+        local.format("%b %-d").to_string()
+    } else {
+        local.format("%b %-d, %Y").to_string()
+    }
+}
+
+fn codex_sessions_base_dir() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".codex").join("sessions"))
+}
+
+fn file_modified_key(path: &Path) -> Option<u128> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    let elapsed = modified.duration_since(UNIX_EPOCH).ok()?;
+    Some(elapsed.as_nanos())
 }
 
 #[cfg(test)]

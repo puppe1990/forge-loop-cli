@@ -79,6 +79,7 @@ The runtime state is stored in `.forge/`:
 - `.last_reset`
 - `.circuit_breaker_state`
 - `.circuit_breaker_history`
+- `.runner_pid`
 
 ## Live visibility (Ralph-style)
 
@@ -89,11 +90,13 @@ The runtime state is stored in `.forge/`:
 - current Codex activity extracted from `.forge/live.log`
 - stalled detection based on heartbeat (`last_heartbeat_at_epoch`)
 - alert when heartbeat is stale (red status panel border and alert line)
+- alert when runner process is missing but status says `running` (stale status)
 - suppressed noise for repeated `codex_core::state_db record_discrepancy` warnings
 
 `forge status` prints `run_timer` and `command_timer`.
 
 `forge run` updates heartbeat (`last_heartbeat_at_epoch`) from real stream events during loop execution.
+If Codex emits no output for 120s, Forge triggers a no-output watchdog and kills that iteration to avoid permanent hangs.
 
 ### Monitor screenshot
 
