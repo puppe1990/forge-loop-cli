@@ -28,6 +28,7 @@ impl Default for CircuitBreakerState {
 #[serde(default)]
 pub struct RunStatus {
     pub state: String,
+    pub thinking_mode: String,
     pub current_loop: u64,
     pub total_loops_executed: u64,
     pub last_error: Option<String>,
@@ -44,6 +45,7 @@ impl Default for RunStatus {
     fn default() -> Self {
         Self {
             state: "idle".to_string(),
+            thinking_mode: "summary".to_string(),
             current_loop: 0,
             total_loops_executed: 0,
             last_error: None,

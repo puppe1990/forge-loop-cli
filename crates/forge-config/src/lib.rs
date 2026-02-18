@@ -11,11 +11,59 @@ pub enum ResumeMode {
     Last,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingMode {
+    Off,
+    Summary,
+    Raw,
+}
+
+impl ThinkingMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThinkingMode::Off => "off",
+            ThinkingMode::Summary => "summary",
+            ThinkingMode::Raw => "raw",
+        }
+    }
+
+    pub fn codex_config_args(self) -> Vec<String> {
+        match self {
+            ThinkingMode::Off => vec![
+                "--config".to_string(),
+                "hide_agent_reasoning=true".to_string(),
+                "--config".to_string(),
+                "show_raw_agent_reasoning=false".to_string(),
+                "--config".to_string(),
+                "model_reasoning_summary=\"none\"".to_string(),
+            ],
+            ThinkingMode::Summary => vec![
+                "--config".to_string(),
+                "hide_agent_reasoning=false".to_string(),
+                "--config".to_string(),
+                "show_raw_agent_reasoning=false".to_string(),
+                "--config".to_string(),
+                "model_reasoning_summary=\"concise\"".to_string(),
+            ],
+            ThinkingMode::Raw => vec![
+                "--config".to_string(),
+                "hide_agent_reasoning=false".to_string(),
+                "--config".to_string(),
+                "show_raw_agent_reasoning=true".to_string(),
+                "--config".to_string(),
+                "model_reasoning_summary=\"detailed\"".to_string(),
+            ],
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RunConfig {
     pub codex_cmd: String,
     pub codex_pre_args: Vec<String>,
     pub codex_exec_args: Vec<String>,
+    pub thinking_mode: ThinkingMode,
     pub max_calls_per_hour: u32,
     pub timeout_minutes: u64,
     pub runtime_dir: PathBuf,
@@ -30,6 +78,7 @@ pub struct RunConfig {
 pub struct CliOverrides {
     pub codex_pre_args: Option<Vec<String>>,
     pub codex_exec_args: Option<Vec<String>>,
+    pub thinking_mode: Option<ThinkingMode>,
     pub max_calls_per_hour: Option<u32>,
     pub timeout_minutes: Option<u64>,
     pub resume: Option<String>,
@@ -41,6 +90,7 @@ struct Forgerc {
     codex_cmd: Option<String>,
     codex_pre_args: Option<Vec<String>>,
     codex_exec_args: Option<Vec<String>>,
+    thinking_mode: Option<ThinkingMode>,
     max_calls_per_hour: Option<u32>,
     timeout_minutes: Option<u64>,
     runtime_dir: Option<String>,
@@ -75,12 +125,20 @@ pub fn load_run_config(cwd: &Path, overrides: &CliOverrides) -> Result<RunConfig
     )
     .unwrap_or_else(|| "codex".to_string());
 
-    let codex_pre_args = first_some(
+    let thinking_mode = first_some(
+        overrides.thinking_mode,
+        env_thinking_mode("FORGE_THINKING_MODE"),
+        file_cfg.thinking_mode,
+    )
+    .unwrap_or(ThinkingMode::Summary);
+
+    let mut codex_pre_args = first_some(
         overrides.codex_pre_args.clone(),
         env_whitespace_args("FORGE_CODEX_PRE_ARGS"),
         file_cfg.codex_pre_args,
     )
     .unwrap_or_default();
+    codex_pre_args.extend(thinking_mode.codex_config_args());
 
     let codex_exec_args = first_some(
         overrides.codex_exec_args.clone(),
@@ -152,6 +210,7 @@ pub fn load_run_config(cwd: &Path, overrides: &CliOverrides) -> Result<RunConfig
         codex_cmd,
         codex_pre_args,
         codex_exec_args,
+        thinking_mode,
         max_calls_per_hour,
         timeout_minutes,
         runtime_dir,
@@ -209,5 +268,15 @@ fn env_whitespace_args(key: &str) -> Option<Vec<String>> {
         None
     } else {
         Some(args)
+    }
+}
+
+fn env_thinking_mode(key: &str) -> Option<ThinkingMode> {
+    let value = env::var(key).ok()?;
+    match value.to_ascii_lowercase().as_str() {
+        "off" => Some(ThinkingMode::Off),
+        "summary" => Some(ThinkingMode::Summary),
+        "raw" => Some(ThinkingMode::Raw),
+        _ => None,
     }
 }

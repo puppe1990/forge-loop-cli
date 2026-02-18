@@ -137,10 +137,19 @@ forge --cwd /absolute/path/to/project run \
   --codex-arg=danger-full-access
 ```
 
+Control thinking verbosity presets (mapped to Codex `--config` flags):
+
+```bash
+forge --cwd /absolute/path/to/project run --thinking off
+forge --cwd /absolute/path/to/project run --thinking summary
+forge --cwd /absolute/path/to/project run --thinking raw
+```
+
 You can also persist these args in `.forgerc`:
 
 ```toml
 codex_pre_args = ["--sandbox", "danger-full-access"]
+thinking_mode = "summary" # off | summary | raw
 ```
 
 To force a new clean loop session (ignore previous runtime/session artifacts):

@@ -33,6 +33,7 @@ fn run_help_shows_required_flags() {
         .stdout(contains("--resume"))
         .stdout(contains("--resume-last"))
         .stdout(contains("--fresh"))
+        .stdout(contains("--thinking"))
         .stdout(contains("--max-calls-per-hour"))
         .stdout(contains("--timeout-minutes"));
 }
@@ -62,6 +63,7 @@ fn analyze_help_shows_flags() {
         .stdout(contains("--modified-only"))
         .stdout(contains("--chunk-size"))
         .stdout(contains("--resume-latest-report"))
+        .stdout(contains("--thinking"))
         .stdout(contains("--codex-arg"))
         .stdout(contains("--timeout-minutes"));
 }

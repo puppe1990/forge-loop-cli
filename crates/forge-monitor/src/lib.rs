@@ -8,6 +8,8 @@ use forge_core::{read_progress, read_status};
 use forge_types::{ProgressSnapshot, RunStatus};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
 use serde_json::Value;
@@ -88,8 +90,9 @@ fn render_status(status: &RunStatus) -> Paragraph<'static> {
         .unwrap_or_else(|| "-".to_string());
 
     let body = format!(
-        "state: {}\ncurrent_loop: {}\nloop_timer: {}\nstalled: {}\nstalled_for: {}\ntotal_loops_executed: {}\ncompletion_indicators: {}\nexit_signal_seen: {}\ncircuit_state: {:?}\nsession_id: {}\nlast_error: {}\nupdated_at_epoch: {}\n\npress 'q' to quit",
+        "state: {}\nthinking_mode: {}\ncurrent_loop: {}\nloop_timer: {}\nstalled: {}\nstalled_for: {}\ntotal_loops_executed: {}\ncompletion_indicators: {}\nexit_signal_seen: {}\ncircuit_state: {:?}\nsession_id: {}\nlast_error: {}\nupdated_at_epoch: {}\n\npress 'q' to quit",
         status.state,
+        status.thinking_mode,
         status.current_loop,
         timer,
         stalled,
@@ -136,31 +139,72 @@ fn render_progress(progress: &ProgressSnapshot) -> Paragraph<'static> {
 
 fn render_activity_and_logs(runtime_dir: &Path) -> Paragraph<'static> {
     let feed = read_live_feed(runtime_dir);
-    let mut body = format!(
-        "source: {}\ncodex_now: {}\n\nrecent logs:\n",
-        feed.source, feed.current
-    );
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(vec![
+            Span::styled("source: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(feed.source),
+        ]),
+        Line::from(vec![
+            Span::styled("codex_now: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(feed.current, Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "recent logs:",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ];
     if feed.recent.is_empty() {
-        body.push_str("-\n");
+        lines.push(Line::from(Span::styled(
+            "-",
+            Style::default().fg(Color::DarkGray),
+        )));
     } else {
-        for line in feed.recent {
-            body.push_str("- ");
-            body.push_str(&line);
-            body.push('\n');
+        for entry in feed.recent {
+            lines.push(Line::from(vec![
+                Span::styled("- ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("[{}] ", entry.kind),
+                    style_for_event_kind(entry.kind).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(entry.text, style_for_event_kind(entry.kind)),
+            ]));
         }
     }
-    Paragraph::new(body).block(
+    Paragraph::new(lines).block(
         Block::default()
             .title("forge live activity + logs")
             .borders(Borders::ALL),
     )
 }
 
+fn style_for_event_kind(kind: &'static str) -> Style {
+    match kind {
+        "FAILURE" => Style::default().fg(Color::Red),
+        "LIMITER" => Style::default().fg(Color::Yellow),
+        "SESSION" => Style::default().fg(Color::Cyan),
+        "LOOP" => Style::default().fg(Color::Magenta),
+        "PROGRESS" => Style::default().fg(Color::Blue),
+        "QUOTA" => Style::default().fg(Color::Green),
+        "ANALYSIS" => Style::default().fg(Color::LightMagenta),
+        "SUCCESS" => Style::default().fg(Color::LightGreen),
+        _ => Style::default().fg(Color::Gray),
+    }
+}
+
 #[derive(Debug)]
 struct LiveFeed {
     source: String,
     current: String,
-    recent: Vec<String>,
+    recent: Vec<LogLine>,
+}
+
+#[derive(Debug)]
+struct LogLine {
+    kind: &'static str,
+    text: String,
 }
 
 fn read_live_feed(runtime_dir: &Path) -> LiveFeed {
@@ -203,7 +247,7 @@ fn resolve_log_source(runtime_dir: &Path) -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.exists())
 }
 
-fn extract_recent_activity_lines(raw: &str, limit: usize) -> Vec<String> {
+fn extract_recent_activity_lines(raw: &str, limit: usize) -> Vec<LogLine> {
     let mut out = Vec::new();
     for line in raw.lines().rev() {
         let trimmed = line.trim();
@@ -220,7 +264,10 @@ fn extract_recent_activity_lines(raw: &str, limit: usize) -> Vec<String> {
             trimmed.chars().take(180).collect()
         };
         let label = classify_log_event(&normalized);
-        out.push(format!("[{label}] {normalized}"));
+        out.push(LogLine {
+            kind: label,
+            text: normalized,
+        });
         if out.len() >= limit {
             break;
         }
@@ -382,7 +429,7 @@ plain text line
 "#;
         let recent = extract_recent_activity_lines(raw, 5);
         assert!(!recent.is_empty());
-        assert!(recent.iter().any(|line| line.contains("[LOOP]")));
+        assert!(recent.iter().any(|line| line.kind == "LOOP"));
     }
 
     #[test]

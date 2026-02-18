@@ -52,6 +52,7 @@ pub fn run_loop(req: RunRequest) -> Result<RunOutcome> {
         read_json_or_default(&runtime_dir.join(".circuit_breaker_state"));
 
     status.state = "running".to_string();
+    status.thinking_mode = req.config.thinking_mode.as_str().to_string();
     status.updated_at_epoch = epoch_now();
     status.circuit_state = circuit.state.clone();
     write_json(&runtime_dir.join("status.json"), &status)?;
@@ -476,6 +477,7 @@ pub fn read_progress(runtime_dir: &Path) -> ProgressSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use forge_config::ThinkingMode;
     use std::fs;
     use tempfile::tempdir;
 
@@ -540,6 +542,7 @@ mod tests {
             codex_cmd: "codex".to_string(),
             codex_pre_args: vec!["--sandbox".to_string(), "danger-full-access".to_string()],
             codex_exec_args: vec![],
+            thinking_mode: ThinkingMode::Summary,
             max_calls_per_hour: 100,
             timeout_minutes: 15,
             runtime_dir: PathBuf::from(".forge"),
@@ -565,6 +568,7 @@ mod tests {
             codex_cmd: "codex".to_string(),
             codex_pre_args: vec!["-s".to_string(), "danger-full-access".to_string()],
             codex_exec_args: vec!["--ephemeral".to_string()],
+            thinking_mode: ThinkingMode::Summary,
             max_calls_per_hour: 100,
             timeout_minutes: 15,
             runtime_dir: PathBuf::from(".forge"),

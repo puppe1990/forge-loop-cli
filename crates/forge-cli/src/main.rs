@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use forge_config::{load_run_config, CliOverrides};
+use forge_config::{load_run_config, CliOverrides, ThinkingMode};
 use forge_core::{read_status, run_loop, ExitReason, RunRequest};
 use forge_monitor::run_monitor;
 use std::env;
@@ -41,6 +41,9 @@ struct RunCommand {
     #[arg(long = "codex-arg")]
     codex_pre_args: Vec<String>,
 
+    #[arg(long, value_enum)]
+    thinking: Option<ThinkingArg>,
+
     #[arg(long)]
     resume: Option<String>,
 
@@ -73,6 +76,9 @@ struct StatusCommand {
 struct AnalyzeCommand {
     #[arg(long = "codex-arg")]
     codex_pre_args: Vec<String>,
+
+    #[arg(long, value_enum)]
+    thinking: Option<ThinkingArg>,
 
     #[arg(long, default_value_t = true)]
     modified_only: bool,
@@ -131,6 +137,23 @@ struct SddLoadCommand {
     id: String,
 }
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum ThinkingArg {
+    Off,
+    Summary,
+    Raw,
+}
+
+impl From<ThinkingArg> for ThinkingMode {
+    fn from(value: ThinkingArg) -> Self {
+        match value {
+            ThinkingArg::Off => ThinkingMode::Off,
+            ThinkingArg::Summary => ThinkingMode::Summary,
+            ThinkingArg::Raw => ThinkingMode::Raw,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SddInterview {
     project_name: String,
@@ -180,6 +203,7 @@ fn assistant_mode(cwd: PathBuf) -> Result<()> {
     run_command(
         RunCommand {
             codex_pre_args: Vec::new(),
+            thinking: None,
             resume: None,
             resume_last: false,
             fresh: false,
@@ -481,6 +505,7 @@ fn run_command(cmd: RunCommand, cwd: PathBuf) -> Result<()> {
                 Some(codex_pre_args)
             },
             codex_exec_args,
+            thinking_mode: cmd.thinking.map(Into::into),
             max_calls_per_hour: cmd.max_calls_per_hour,
             timeout_minutes: cmd.timeout_minutes,
             resume: cmd.resume,
@@ -530,6 +555,7 @@ fn analyze_command(cmd: AnalyzeCommand, cwd: PathBuf) -> Result<()> {
         &CliOverrides {
             codex_pre_args: codex_pre_args_override,
             codex_exec_args: Some(vec!["--ephemeral".to_string()]),
+            thinking_mode: cmd.thinking.map(Into::into),
             max_calls_per_hour: None,
             timeout_minutes: cmd.timeout_minutes,
             resume: None,
@@ -1010,6 +1036,7 @@ fn status_command(cmd: StatusCommand, cwd: PathBuf) -> Result<()> {
         };
 
         println!("state: {}", status.state);
+        println!("thinking_mode: {}", status.thinking_mode);
         println!("current_loop: {}", status.current_loop);
         println!("loop_timer: {}", loop_timer);
         println!("total_loops_executed: {}", status.total_loops_executed);
