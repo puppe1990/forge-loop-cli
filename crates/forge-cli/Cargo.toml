@@ -1,0 +1,21 @@
+[package]
+name = "forge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "forge"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+forge-config = { path = "../forge-config" }
+forge-core = { path = "../forge-core" }
+forge-monitor = { path = "../forge-monitor" }
+
+[dev-dependencies]
+assert_cmd.workspace = true
+predicates.workspace = true

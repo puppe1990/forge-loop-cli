@@ -1,0 +1,15 @@
+[package]
+name = "forge-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+forge-config = { path = "../forge-config" }
+forge-types = { path = "../forge-types" }
+
+[dev-dependencies]
+tempfile.workspace = true
