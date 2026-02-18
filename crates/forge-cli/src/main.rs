@@ -159,6 +159,7 @@ struct SddInterview {
     project_name: String,
     product_goal: String,
     target_users: String,
+    thinking: ThinkingArg,
     in_scope: String,
     out_of_scope: String,
     constraints: String,
@@ -203,7 +204,7 @@ fn assistant_mode(cwd: PathBuf) -> Result<()> {
     run_command(
         RunCommand {
             codex_pre_args: Vec::new(),
-            thinking: None,
+            thinking: Some(answers.thinking),
             resume: None,
             resume_last: false,
             fresh: false,
@@ -327,6 +328,9 @@ fn collect_sdd_answers() -> Result<SddInterview> {
         "contract CLI tests, acceptance loop tests, resilience tests",
     )?;
 
+    println!("\n[Phase 7] Reasoning");
+    let thinking = ask_thinking("thinking mode", ThinkingArg::Summary)?;
+
     let max_loops_str = ask("max loops for execution", "100")?;
     let max_loops = max_loops_str.trim().parse::<u64>().unwrap_or(100);
 
@@ -334,6 +338,7 @@ fn collect_sdd_answers() -> Result<SddInterview> {
         project_name,
         product_goal,
         target_users,
+        thinking,
         in_scope,
         out_of_scope,
         constraints,
@@ -342,6 +347,25 @@ fn collect_sdd_answers() -> Result<SddInterview> {
         tests,
         max_loops,
     })
+}
+
+fn ask_thinking(label: &str, default: ThinkingArg) -> Result<ThinkingArg> {
+    let default_str = match default {
+        ThinkingArg::Off => "off",
+        ThinkingArg::Summary => "summary",
+        ThinkingArg::Raw => "raw",
+    };
+    loop {
+        let value = ask(label, default_str)?;
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => return Ok(ThinkingArg::Off),
+            "summary" => return Ok(ThinkingArg::Summary),
+            "raw" => return Ok(ThinkingArg::Raw),
+            _ => {
+                println!("invalid thinking mode. use: off | summary | raw");
+            }
+        }
+    }
 }
 
 fn ask(label: &str, default: &str) -> Result<String> {
@@ -472,7 +496,7 @@ fn render_plan(a: &SddInterview) -> String {
     let epoch = epoch_now();
 
     format!(
-        "# Execution Plan\n\nGenerated at epoch {}\n\n## Goal\n{}\n\n## Scope\n- In: {}\n- Out: {}\n\n## Constraints\n{}\n\n## Acceptance\n{}\n\n## Scenarios\n{}\n\n## Test Strategy\n{}\n\nExecute this plan incrementally. Only stop when completion indicators are present and EXIT_SIGNAL is true. Persist status and progress in .forge/.\n",
+        "# Execution Plan\n\nGenerated at epoch {}\n\n## Goal\n{}\n\n## Scope\n- In: {}\n- Out: {}\n\n## Constraints\n{}\n\n## Acceptance\n{}\n\n## Scenarios\n{}\n\n## Test Strategy\n{}\n\n## Thinking Mode\n{}\n\nExecute this plan incrementally. Only stop when completion indicators are present and EXIT_SIGNAL is true. Persist status and progress in .forge/.\n",
         epoch,
         a.product_goal,
         a.in_scope,
@@ -481,6 +505,11 @@ fn render_plan(a: &SddInterview) -> String {
         a.acceptance_criteria,
         a.scenarios,
         a.tests,
+        match a.thinking {
+            ThinkingArg::Off => "off",
+            ThinkingArg::Summary => "summary",
+            ThinkingArg::Raw => "raw",
+        },
     )
 }
 

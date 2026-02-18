@@ -41,6 +41,7 @@ Running `forge` with no subcommand starts an interview in phases:
 4. Acceptance criteria
 5. Given/When/Then scenarios
 6. Testing strategy
+7. Thinking mode (`off`, `summary`, `raw`)
 
 It generates:
 
