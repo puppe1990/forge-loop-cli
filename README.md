@@ -2,6 +2,17 @@
 
 Standalone Rust CLI for autonomous coding loops.
 
+## Prerequisites
+
+- Rust stable toolchain
+- Codex CLI installed and available in `PATH`
+
+Check your Codex installation:
+
+```bash
+codex --version
+```
+
 ## Why
 
 `forge` runs a spec-driven workflow:
@@ -61,6 +72,14 @@ cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
+
+## Quick Start
+
+```bash
+cargo run -p forge
+```
+
+This starts the interactive SDD assistant, generates specs/plan files, and then executes the loop with Codex CLI.
 
 ## License
 
