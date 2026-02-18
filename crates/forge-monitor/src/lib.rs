@@ -13,7 +13,7 @@ use ratatui::Terminal;
 use serde_json::Value;
 use std::fs;
 use std::io::{self, Stdout};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const STALL_THRESHOLD_SECS: u64 = 15;
@@ -48,15 +48,15 @@ fn monitor_loop(
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Percentage(45),
-                    Constraint::Percentage(30),
-                    Constraint::Percentage(25),
+                    Constraint::Percentage(32),
+                    Constraint::Percentage(20),
+                    Constraint::Percentage(48),
                 ])
                 .split(f.area());
 
             let top = render_status(&status);
             let bottom = render_progress(&progress);
-            let activity = render_activity(runtime_dir);
+            let activity = render_activity_and_logs(runtime_dir);
 
             f.render_widget(top, chunks[0]);
             f.render_widget(bottom, chunks[1]);
@@ -134,23 +134,99 @@ fn render_progress(progress: &ProgressSnapshot) -> Paragraph<'static> {
     )
 }
 
-fn render_activity(runtime_dir: &Path) -> Paragraph<'static> {
-    let activity = read_live_activity(runtime_dir);
-    let body = format!("codex_now: {}", activity);
+fn render_activity_and_logs(runtime_dir: &Path) -> Paragraph<'static> {
+    let feed = read_live_feed(runtime_dir);
+    let mut body = format!(
+        "source: {}\ncodex_now: {}\n\nrecent logs:\n",
+        feed.source, feed.current
+    );
+    if feed.recent.is_empty() {
+        body.push_str("-\n");
+    } else {
+        for line in feed.recent {
+            body.push_str("- ");
+            body.push_str(&line);
+            body.push('\n');
+        }
+    }
     Paragraph::new(body).block(
         Block::default()
-            .title("forge live activity")
+            .title("forge live activity + logs")
             .borders(Borders::ALL),
     )
 }
 
-fn read_live_activity(runtime_dir: &Path) -> String {
-    let path = runtime_dir.join("live.log");
-    let raw = match fs::read_to_string(path) {
-        Ok(value) => value,
-        Err(_) => return "-".to_string(),
+#[derive(Debug)]
+struct LiveFeed {
+    source: String,
+    current: String,
+    recent: Vec<String>,
+}
+
+fn read_live_feed(runtime_dir: &Path) -> LiveFeed {
+    let Some(path) = resolve_log_source(runtime_dir) else {
+        return LiveFeed {
+            source: "-".to_string(),
+            current: "-".to_string(),
+            recent: Vec::new(),
+        };
     };
-    extract_latest_activity(&raw).unwrap_or_else(|| "-".to_string())
+
+    let raw = match fs::read_to_string(&path) {
+        Ok(value) => value,
+        Err(_) => {
+            return LiveFeed {
+                source: path.display().to_string(),
+                current: "-".to_string(),
+                recent: Vec::new(),
+            }
+        }
+    };
+    LiveFeed {
+        source: path.display().to_string(),
+        current: extract_latest_activity(&raw).unwrap_or_else(|| "-".to_string()),
+        recent: extract_recent_activity_lines(&raw, 14),
+    }
+}
+
+fn resolve_log_source(runtime_dir: &Path) -> Option<PathBuf> {
+    let mut candidates = vec![runtime_dir.join("ralph.logs"), runtime_dir.join("live.log")];
+    if let Some(project_dir) = runtime_dir.parent() {
+        candidates.push(project_dir.join(".ralph").join("logs").join("ralph.log"));
+        candidates.push(
+            project_dir
+                .join(".ralph")
+                .join("logs")
+                .join("ralph-gemini.log"),
+        );
+    }
+    candidates.into_iter().find(|p| p.exists())
+}
+
+fn extract_recent_activity_lines(raw: &str, limit: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in raw.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed == "[stdout]" || trimmed == "[stderr]" {
+            continue;
+        }
+        let normalized = if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+            if let Some(text) = parse_activity_event(&value) {
+                text
+            } else {
+                continue;
+            }
+        } else {
+            trimmed.chars().take(180).collect()
+        };
+        let label = classify_log_event(&normalized);
+        out.push(format!("[{label}] {normalized}"));
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out.reverse();
+    out
 }
 
 fn extract_latest_activity(raw: &str) -> Option<String> {
@@ -174,6 +250,53 @@ fn extract_latest_activity(raw: &str) -> Option<String> {
         return Some(trimmed.chars().take(180).collect());
     }
     None
+}
+
+fn classify_log_event(line: &str) -> &'static str {
+    let text = line.to_ascii_lowercase();
+    if text.contains("permission denied")
+        || text.contains("timed out")
+        || text.contains("execution failed")
+        || text.contains("non-ignorable diagnostics")
+        || text.contains("failed")
+        || text.contains("error")
+    {
+        return "FAILURE";
+    }
+    if text.contains("rate limit")
+        || text.contains("api usage limit")
+        || text.contains("circuit breaker")
+        || text.contains("retrying in")
+    {
+        return "LIMITER";
+    }
+    if text.contains("session reset")
+        || text.contains("starting new")
+        || text.contains("resuming")
+        || text.contains("resume strategy")
+    {
+        return "SESSION";
+    }
+    if text.contains("starting loop")
+        || text.contains("completed loop")
+        || text.contains("loop ")
+        || text.contains("executing")
+    {
+        return "LOOP";
+    }
+    if text.contains("progress") || text.contains("working") {
+        return "PROGRESS";
+    }
+    if text.contains("quota") {
+        return "QUOTA";
+    }
+    if text.contains("analyzing") || text.contains("analysis") {
+        return "ANALYSIS";
+    }
+    if text.contains("success") || text.contains("completed") {
+        return "SUCCESS";
+    }
+    "INFO"
 }
 
 fn parse_activity_event(value: &Value) -> Option<String> {
@@ -242,6 +365,24 @@ plain text line
 "#;
         let activity = extract_latest_activity(raw).expect("activity");
         assert_eq!(activity, "plain text line");
+    }
+
+    #[test]
+    fn classifies_loop_line() {
+        let label = classify_log_event("loop 2: codex exec started");
+        assert_eq!(label, "LOOP");
+    }
+
+    #[test]
+    fn extracts_recent_lines_with_labels() {
+        let raw = r#"
+[stdout]
+{"type":"item.completed","item":{"type":"agent_message","text":"loop 1: codex exec started"}}
+plain text line
+"#;
+        let recent = extract_recent_activity_lines(raw, 5);
+        assert!(!recent.is_empty());
+        assert!(recent.iter().any(|line| line.contains("[LOOP]")));
     }
 
     #[test]

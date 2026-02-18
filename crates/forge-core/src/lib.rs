@@ -64,6 +64,13 @@ pub fn run_loop(req: RunRequest) -> Result<RunOutcome> {
         status.current_loop_started_at_epoch = epoch_now();
         status.updated_at_epoch = epoch_now();
         write_json(&runtime_dir.join("status.json"), &status)?;
+        progress.last_summary = format!("loop {} started: invoking codex", loop_count);
+        progress.updated_at_epoch = epoch_now();
+        write_json(&runtime_dir.join("progress.json"), &progress)?;
+        append_live_activity(
+            &runtime_dir.join("live.log"),
+            &format!("loop {}: codex exec started", loop_count),
+        )?;
 
         let rate = check_and_increment_call_count(&runtime_dir, req.config.max_calls_per_hour)?;
         if !rate.allowed {
@@ -93,6 +100,17 @@ pub fn run_loop(req: RunRequest) -> Result<RunOutcome> {
                 Ok(())
             })?;
         append_live_log(&runtime_dir.join("live.log"), &stdout, &stderr)?;
+        let end_state = if timed_out {
+            "timed_out"
+        } else if exit_ok {
+            "completed"
+        } else {
+            "failed"
+        };
+        append_live_activity(
+            &runtime_dir.join("live.log"),
+            &format!("loop {}: codex exec {}", loop_count, end_state),
+        )?;
 
         let analysis = analyze_output(&stdout, &stderr, &req.config.completion_indicators);
 
@@ -190,7 +208,13 @@ where
     F: FnMut() -> Result<()>,
 {
     let args = build_command_args(config, cwd);
-    let timeout = Duration::from_secs(config.timeout_minutes.saturating_mul(60));
+    let timeout = if config.timeout_minutes == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(
+            config.timeout_minutes.saturating_mul(60),
+        ))
+    };
     let mut child = Command::new(&config.codex_cmd)
         .args(&args)
         .current_dir(cwd)
@@ -206,10 +230,12 @@ where
         if child.try_wait()?.is_some() {
             break;
         }
-        if started.elapsed() >= timeout {
-            timed_out = true;
-            let _ = child.kill();
-            break;
+        if let Some(limit) = timeout {
+            if started.elapsed() >= limit {
+                timed_out = true;
+                let _ = child.kill();
+                break;
+            }
         }
         thread::sleep(Duration::from_millis(200));
     }
@@ -404,6 +430,16 @@ fn append_live_log(path: &Path, stdout: &str, stderr: &str) -> Result<()> {
         writeln!(file, "[stderr]\n{}", stderr.trim()).context("failed to write stderr log")?;
     }
     Ok(())
+}
+
+fn append_live_activity(path: &Path, text: &str) -> Result<()> {
+    let payload = serde_json::json!({
+        "item": {
+            "type": "agent_message",
+            "text": text,
+        }
+    });
+    append_history(path, &format!("{}\n", serde_json::to_string(&payload)?))
 }
 
 fn append_history(path: &Path, line: &str) -> Result<()> {
