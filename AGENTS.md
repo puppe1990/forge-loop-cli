@@ -14,8 +14,21 @@ This document defines engineering guidance for AI/code agents working in this re
 - `crates/forge-cli`: CLI surface (`forge`, `run`, `status`, `monitor`, `sdd`)
 - `crates/forge-core`: loop engine, output analysis, rate limit, circuit breaker
 - `crates/forge-config`: `.forgerc` and env/flag precedence
+- `crates/forge-engine`: Engine trait and implementations (Codex, OpenCode)
 - `crates/forge-monitor`: TUI monitor
 - `crates/forge-types`: shared serializable types
+
+## Engines
+
+Forge supports multiple AI coding engines via the `Engine` trait in `forge-engine`:
+
+- **Codex** (default): OpenAI's Codex CLI
+- **OpenCode**: Open source AI coding agent
+
+To add a new engine:
+1. Implement the `Engine` trait in `forge-engine/src/lib.rs`
+2. Add the engine variant to `EngineKind` in `forge-config/src/lib.rs`
+3. Update `create_engine()` factory function
 
 ## SDD Workflow
 
@@ -62,7 +75,7 @@ Status semantics:
 
 - `run_started_at_epoch`: start of current `forge run`
 - `current_loop_started_at_epoch`: start of current loop command
-- `last_heartbeat_at_epoch`: last real output/stream heartbeat from Codex process
+- `last_heartbeat_at_epoch`: last real output/stream heartbeat from engine process
 - `.runner_pid`: PID of active forge run process (used by monitor to detect stale `running` state)
 
 ## Config Precedence
@@ -74,11 +87,12 @@ Always preserve precedence:
 3. `.forgerc`
 4. Defaults
 
-Codex runtime global flags can be passed via:
+Engine runtime flags can be passed via:
 
-- `forge run --codex-arg=<value>` (repeatable)
-- `forge run --full-access` (forces `--sandbox danger-full-access`)
-- `.forgerc` key `codex_pre_args = ["--sandbox", "danger-full-access"]`
+- `forge run --engine <codex|opencode>` (select engine)
+- `forge run --engine-arg=<value>` (repeatable)
+- `forge run --full-access` (forces sandbox bypass)
+- `.forgerc` key `engine_pre_args = ["--sandbox", "danger-full-access"]`
 
 Monitor tuning:
 
@@ -103,6 +117,7 @@ cargo test --workspace
 
 - Add or update contract tests in `crates/forge-cli/tests/`
 - Add core behavior tests in `crates/forge-core/tests/`
+- Add engine tests in `crates/forge-engine/src/lib.rs`
 - Validate `fmt`, `clippy`, and `test` before proposing changes
 
 ## Documentation Sync
@@ -117,6 +132,7 @@ When changing user-facing behavior, update at least:
 
 - Use `forge` naming only
 - Do not introduce legacy `ralph` naming in code, docs, env vars, or output
+- Use `engine` for generic engine references (not `codex` specific)
 
 ## Safety Rules
 

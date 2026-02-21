@@ -14,11 +14,12 @@ fn cli_overrides_file_values() {
     let cfg = load_run_config(
         dir.path(),
         &CliOverrides {
-            codex_pre_args: Some(vec![
+            engine: None,
+            engine_pre_args: Some(vec![
                 "--sandbox".to_string(),
                 "danger-full-access".to_string(),
             ]),
-            codex_exec_args: None,
+            engine_exec_args: None,
             thinking_mode: None,
             max_calls_per_hour: Some(77),
             timeout_minutes: Some(22),
@@ -31,14 +32,14 @@ fn cli_overrides_file_values() {
     assert_eq!(cfg.max_calls_per_hour, 77);
     assert_eq!(cfg.timeout_minutes, 22);
     assert!(cfg
-        .codex_pre_args
+        .engine_pre_args
         .starts_with(&["--sandbox".to_string(), "danger-full-access".to_string()]));
     assert!(cfg
-        .codex_pre_args
+        .engine_pre_args
         .windows(2)
         .any(|w| w == ["--config", "hide_agent_reasoning=false"]));
     assert!(cfg
-        .codex_pre_args
+        .engine_pre_args
         .windows(2)
         .any(|w| w == ["--config", "show_raw_agent_reasoning=false"]));
     assert!(matches!(cfg.resume_mode, ResumeMode::Last));
@@ -50,8 +51,9 @@ fn thinking_mode_raw_adds_raw_reasoning_flags() {
     let cfg = load_run_config(
         dir.path(),
         &CliOverrides {
-            codex_pre_args: None,
-            codex_exec_args: None,
+            engine: None,
+            engine_pre_args: None,
+            engine_exec_args: None,
             thinking_mode: Some(forge_config::ThinkingMode::Raw),
             max_calls_per_hour: None,
             timeout_minutes: None,
@@ -63,7 +65,7 @@ fn thinking_mode_raw_adds_raw_reasoning_flags() {
 
     assert_eq!(cfg.thinking_mode, forge_config::ThinkingMode::Raw);
     assert!(cfg
-        .codex_pre_args
+        .engine_pre_args
         .windows(2)
         .any(|w| w == ["--config", "show_raw_agent_reasoning=true"]));
 }

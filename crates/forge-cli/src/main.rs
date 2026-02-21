@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Datelike, Local, TimeZone, Utc};
 use clap::{Parser, Subcommand};
-use forge_config::{load_run_config, CliOverrides, ThinkingMode};
+use forge_config::{load_run_config, CliOverrides, EngineKind, ThinkingMode};
 use forge_core::{read_status, run_loop, ExitReason, RunRequest};
 use forge_monitor::run_monitor;
 use serde_json::Value;
@@ -40,8 +40,11 @@ enum Commands {
 
 #[derive(Debug, clap::Args)]
 struct RunCommand {
-    #[arg(long = "codex-arg")]
-    codex_pre_args: Vec<String>,
+    #[arg(long, value_enum, default_value = "codex")]
+    engine: EngineArg,
+
+    #[arg(long = "engine-arg")]
+    engine_pre_args: Vec<String>,
 
     #[arg(long)]
     full_access: bool,
@@ -79,8 +82,11 @@ struct StatusCommand {
 
 #[derive(Debug, clap::Args)]
 struct AnalyzeCommand {
-    #[arg(long = "codex-arg")]
-    codex_pre_args: Vec<String>,
+    #[arg(long, value_enum, default_value = "codex")]
+    engine: EngineArg,
+
+    #[arg(long = "engine-arg")]
+    engine_pre_args: Vec<String>,
 
     #[arg(long)]
     full_access: bool,
@@ -165,6 +171,21 @@ impl From<ThinkingArg> for ThinkingMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum EngineArg {
+    Codex,
+    OpenCode,
+}
+
+impl From<EngineArg> for EngineKind {
+    fn from(value: EngineArg) -> Self {
+        match value {
+            EngineArg::Codex => EngineKind::Codex,
+            EngineArg::OpenCode => EngineKind::OpenCode,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SddInterview {
     project_name: String,
@@ -214,7 +235,8 @@ fn assistant_mode(cwd: PathBuf) -> Result<()> {
 
     run_command(
         RunCommand {
-            codex_pre_args: Vec::new(),
+            engine: EngineArg::Codex,
+            engine_pre_args: Vec::new(),
             full_access: false,
             thinking: Some(answers.thinking),
             resume: None,
@@ -530,8 +552,8 @@ fn run_command(cmd: RunCommand, cwd: PathBuf) -> Result<()> {
         cleanup_runtime_state(&cwd)?;
     }
 
-    let codex_pre_args = with_full_access_args(cmd.codex_pre_args.clone(), cmd.full_access);
-    let codex_exec_args = if cmd.fresh {
+    let engine_pre_args = with_full_access_args(cmd.engine_pre_args.clone(), cmd.full_access);
+    let engine_exec_args = if cmd.fresh {
         Some(vec!["--ephemeral".to_string()])
     } else {
         None
@@ -540,12 +562,13 @@ fn run_command(cmd: RunCommand, cwd: PathBuf) -> Result<()> {
     let cfg = load_run_config(
         &cwd,
         &CliOverrides {
-            codex_pre_args: if codex_pre_args.is_empty() {
+            engine: Some(cmd.engine.into()),
+            engine_pre_args: if engine_pre_args.is_empty() {
                 None
             } else {
-                Some(codex_pre_args)
+                Some(engine_pre_args)
             },
-            codex_exec_args,
+            engine_exec_args,
             thinking_mode: cmd.thinking.map(Into::into),
             max_calls_per_hour: cmd.max_calls_per_hour,
             timeout_minutes: cmd.timeout_minutes,
@@ -585,18 +608,19 @@ fn run_command(cmd: RunCommand, cwd: PathBuf) -> Result<()> {
 }
 
 fn analyze_command(cmd: AnalyzeCommand, cwd: PathBuf) -> Result<()> {
-    let codex_pre_args = with_full_access_args(cmd.codex_pre_args.clone(), cmd.full_access);
-    let codex_pre_args_override = if codex_pre_args.is_empty() {
+    let engine_pre_args = with_full_access_args(cmd.engine_pre_args.clone(), cmd.full_access);
+    let engine_pre_args_override = if engine_pre_args.is_empty() {
         None
     } else {
-        Some(codex_pre_args)
+        Some(engine_pre_args)
     };
 
     let cfg = load_run_config(
         &cwd,
         &CliOverrides {
-            codex_pre_args: codex_pre_args_override,
-            codex_exec_args: Some(vec!["--ephemeral".to_string()]),
+            engine: Some(cmd.engine.into()),
+            engine_pre_args: engine_pre_args_override,
+            engine_exec_args: Some(vec!["--ephemeral".to_string()]),
             thinking_mode: cmd.thinking.map(Into::into),
             max_calls_per_hour: None,
             timeout_minutes: cmd.timeout_minutes,
@@ -647,10 +671,10 @@ fn analyze_command(cmd: AnalyzeCommand, cwd: PathBuf) -> Result<()> {
             chunk.len()
         );
         let prompt = build_analyze_prompt(chunk, &format!("chunk {}/{}", idx + 1, chunks.len()));
-        let run = run_codex_exec_with_timeout(
-            &cfg.codex_cmd,
-            &cfg.codex_pre_args,
-            &cfg.codex_exec_args,
+        let run = run_engine_exec_with_timeout(
+            &cfg.engine_cmd,
+            &cfg.engine_pre_args,
+            &cfg.engine_exec_args,
             &cwd,
             &prompt,
             cfg.timeout_minutes,
@@ -688,10 +712,10 @@ fn analyze_command(cmd: AnalyzeCommand, cwd: PathBuf) -> Result<()> {
         let synthesis_prompt = format!(
             "Consolidate the following chunk analyses into exactly:\n1) Critical risks\n2) High risks\n3) Medium risks\n4) Suggested next actions\nEnd with: EXIT_SIGNAL: true\n\n{joined}"
         );
-        let synthesis = run_codex_exec_with_timeout(
-            &cfg.codex_cmd,
-            &cfg.codex_pre_args,
-            &cfg.codex_exec_args,
+        let synthesis = run_engine_exec_with_timeout(
+            &cfg.engine_cmd,
+            &cfg.engine_pre_args,
+            &cfg.engine_exec_args,
             &cwd,
             &synthesis_prompt,
             cfg.timeout_minutes,
@@ -820,10 +844,10 @@ fn analyze_resume_latest(
     let synthesis_prompt = format!(
         "Consolidate the following chunk analyses into exactly:\n1) Critical risks\n2) High risks\n3) Medium risks\n4) Suggested next actions\nEnd with: EXIT_SIGNAL: true\n\n{joined}"
     );
-    let synthesis = run_codex_exec_with_timeout(
-        &cfg.codex_cmd,
-        &cfg.codex_pre_args,
-        &cfg.codex_exec_args,
+    let synthesis = run_engine_exec_with_timeout(
+        &cfg.engine_cmd,
+        &cfg.engine_pre_args,
+        &cfg.engine_exec_args,
         &cwd,
         &synthesis_prompt,
         cfg.timeout_minutes,
@@ -933,7 +957,7 @@ fn load_latest_analyze_payload(cwd: &Path) -> Result<serde_json::Value> {
 }
 
 #[derive(Debug)]
-struct CodexExecRun {
+struct EngineExecRun {
     report: String,
     exit_code: Option<i32>,
     timed_out: bool,
@@ -991,28 +1015,28 @@ fn persist_analyze_report(
     })
 }
 
-fn run_codex_exec_with_timeout(
-    codex_cmd: &str,
-    codex_pre_args: &[String],
-    codex_exec_args: &[String],
+fn run_engine_exec_with_timeout(
+    engine_cmd: &str,
+    engine_pre_args: &[String],
+    engine_exec_args: &[String],
     cwd: &Path,
     prompt: &str,
     timeout_minutes: u64,
-) -> Result<CodexExecRun> {
-    let mut args = codex_pre_args.to_vec();
+) -> Result<EngineExecRun> {
+    let mut args = engine_pre_args.to_vec();
     args.push("exec".to_string());
-    args.extend(codex_exec_args.iter().cloned());
+    args.extend(engine_exec_args.iter().cloned());
     args.push("--json".to_string());
     args.push(prompt.to_string());
 
     let timeout = Duration::from_secs(timeout_minutes.saturating_mul(60));
-    let mut child = Command::new(codex_cmd)
+    let mut child = Command::new(engine_cmd)
         .args(&args)
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("failed to execute {}", codex_cmd))?;
+        .with_context(|| format!("failed to execute {}", engine_cmd))?;
     let started = Instant::now();
     let mut timed_out = false;
     loop {
@@ -1028,7 +1052,7 @@ fn run_codex_exec_with_timeout(
     }
     let output = child
         .wait_with_output()
-        .with_context(|| format!("failed waiting for {}", codex_cmd))?;
+        .with_context(|| format!("failed waiting for {}", engine_cmd))?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let report = extract_last_agent_message(&stdout).unwrap_or_else(|| {
@@ -1036,7 +1060,7 @@ fn run_codex_exec_with_timeout(
         merged.chars().take(4000).collect()
     });
 
-    Ok(CodexExecRun {
+    Ok(EngineExecRun {
         report,
         exit_code: output.status.code(),
         timed_out,
@@ -1534,15 +1558,20 @@ struct DoctorCheck {
 }
 
 fn collect_doctor_checks(cwd: &Path) -> Vec<DoctorCheck> {
-    let codex = check_codex_available();
+    let cfg = load_run_config(cwd, &CliOverrides::default()).ok();
+    let engine = if let Some(ref c) = cfg {
+        check_engine_available(c.engine, &c.engine_cmd)
+    } else {
+        check_engine_available(EngineKind::Codex, "codex")
+    };
     let git = check_git_repo(cwd);
     let write = check_runtime_writable(cwd);
     let config = check_config_loadable(cwd);
     vec![
         DoctorCheck {
-            name: "codex_available",
-            ok: codex.0,
-            detail: codex.1,
+            name: "engine_available",
+            ok: engine.0,
+            detail: engine.1,
         },
         DoctorCheck {
             name: "git_repository",
@@ -1574,7 +1603,7 @@ fn apply_doctor_fixes(cwd: &Path) -> Result<Vec<String>> {
 
     let forgerc = cwd.join(".forgerc");
     if !forgerc.exists() {
-        let template = "# forge defaults\nmax_calls_per_hour = 100\ntimeout_minutes = 15\n";
+        let template = "# forge defaults\nengine = \"codex\"\nmax_calls_per_hour = 100\ntimeout_minutes = 15\n";
         fs::write(&forgerc, template)
             .with_context(|| format!("failed to write {}", forgerc.display()))?;
         fixes.push("created .forgerc with baseline defaults".to_string());
@@ -1599,14 +1628,14 @@ fn collect_doctor_warnings(cwd: &Path) -> Vec<String> {
     warnings
 }
 
-fn check_codex_available() -> (bool, String) {
-    match Command::new("codex").arg("--version").output() {
+fn check_engine_available(engine: EngineKind, cmd: &str) -> (bool, String) {
+    match Command::new(cmd).arg("--version").output() {
         Ok(output) if output.status.success() => {
             let v = String::from_utf8_lossy(&output.stdout).trim().to_string();
             (
                 true,
                 if v.is_empty() {
-                    "codex found".to_string()
+                    format!("{} found", engine.as_str())
                 } else {
                     v
                 },
@@ -1614,9 +1643,13 @@ fn check_codex_available() -> (bool, String) {
         }
         Ok(output) => (
             false,
-            format!("codex returned exit code {:?}", output.status.code()),
+            format!(
+                "{} returned exit code {:?}",
+                engine.as_str(),
+                output.status.code()
+            ),
         ),
-        Err(err) => (false, format!("codex not available: {}", err)),
+        Err(err) => (false, format!("{} not available: {}", engine.as_str(), err)),
     }
 }
 

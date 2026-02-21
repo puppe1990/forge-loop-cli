@@ -1,5 +1,5 @@
 [package]
-name = "forge-core"
+name = "forge-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,11 +8,10 @@ license.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+chrono.workspace = true
 forge-config = { path = "../forge-config" }
 forge-types = { path = "../forge-types" }
-forge-engine = { path = "../forge-engine" }
 libc.workspace = true
-chrono.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

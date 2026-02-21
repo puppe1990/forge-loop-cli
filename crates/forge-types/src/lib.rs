@@ -70,3 +70,12 @@ pub struct ProgressSnapshot {
     pub last_summary: String,
     pub updated_at_epoch: u64,
 }
+
+#[derive(Debug, Clone, Default)]
+pub struct OutputAnalysis {
+    pub exit_signal_true: bool,
+    pub completion_indicators: u32,
+    pub has_error: bool,
+    pub has_progress_hint: bool,
+    pub session_id: Option<String>,
+}

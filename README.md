@@ -5,12 +5,13 @@ Standalone Rust CLI for autonomous coding loops.
 ## Prerequisites
 
 - Rust stable toolchain
-- Codex CLI installed and available in `PATH`
+- Codex CLI or OpenCode CLI installed and available in `PATH`
 
-Check your Codex installation:
+Check your installation:
 
 ```bash
-codex --version
+codex --version   # for Codex engine
+opencode --version # for OpenCode engine
 ```
 
 ## Why
@@ -21,13 +22,34 @@ codex --version
 2. Write plan/spec artifacts.
 3. Execute implementation loop with guarded completion.
 
+## Engines
+
+Forge supports multiple AI coding engines:
+
+- **Codex** (default) - OpenAI's Codex CLI
+- **OpenCode** - Open source AI coding agent
+
+Select the engine via CLI flag:
+
+```bash
+forge run --engine codex    # default
+forge run --engine opencode # use OpenCode
+```
+
+Or configure in `.forgerc`:
+
+```toml
+engine = "opencode"
+```
+
 ## Commands
 
 - `forge` (interactive assistant mode: asks SDD questions, writes plan/specs, then runs loop)
-- `forge run [--full-access] [--thinking off|summary|raw] [--max-loops N] [--timeout-minutes N]`
-- `forge analyze --modified-only`
+- `forge run [--engine codex|opencode] [--full-access] [--thinking off|summary|raw] [--max-loops N] [--timeout-minutes N]`
+- `forge analyze [--engine codex|opencode] --modified-only`
 - `forge status`
 - `forge monitor [--refresh-ms N] [--stall-threshold-secs N]`
+- `forge doctor`
 - `forge sdd list`
 - `forge sdd load <id>`
 
@@ -81,26 +103,21 @@ The runtime state is stored in `.forge/`:
 - `.circuit_breaker_history`
 - `.runner_pid`
 
-## Live visibility (Ralph-style)
+## Live visibility
 
-`forge monitor` now shows, in real time:
+`forge monitor` shows, in real time:
 
 - current loop
 - run timer and current command timer (`HH:MM:SS`)
-- current Codex activity extracted from `.forge/live.log`
+- current engine activity extracted from `.forge/live.log`
 - stalled detection based on heartbeat (`last_heartbeat_at_epoch`)
 - alert when heartbeat is stale (red status panel border and alert line)
 - alert when runner process is missing but status says `running` (stale status)
-- suppressed noise for repeated `codex_core::state_db record_discrepancy` warnings
 
 `forge status` prints `run_timer` and `command_timer`.
 
 `forge run` updates heartbeat (`last_heartbeat_at_epoch`) from real stream events during loop execution.
-If Codex emits no output for 120s, Forge triggers a no-output watchdog and kills that iteration to avoid permanent hangs.
-
-### Monitor screenshot
-
-![Forge monitor live view](docs/assets/forge-monitor-live.png)
+If the engine emits no output for 120s, Forge triggers a no-output watchdog and kills that iteration to avoid permanent hangs.
 
 ## Config precedence
 
@@ -139,12 +156,18 @@ To run against a different folder without changing directories:
 cargo run -p forge -- --cwd /absolute/path/to/project
 ```
 
-To pass native `codex` global flags through `forge run`:
+To use OpenCode instead of Codex:
+
+```bash
+forge --cwd /absolute/path/to/project run --engine opencode
+```
+
+To pass native engine flags through `forge run`:
 
 ```bash
 forge --cwd /absolute/path/to/project run \
-  --codex-arg=--sandbox \
-  --codex-arg=danger-full-access
+  --engine-arg=--sandbox \
+  --engine-arg=danger-full-access
 ```
 
 Shortcut for full sandbox permissions:
@@ -153,7 +176,7 @@ Shortcut for full sandbox permissions:
 forge --cwd /absolute/path/to/project run --full-access
 ```
 
-Control thinking verbosity presets (mapped to Codex `--config` flags):
+Control thinking verbosity presets:
 
 ```bash
 forge --cwd /absolute/path/to/project run --thinking off
@@ -170,8 +193,9 @@ forge --cwd /absolute/path/to/project monitor --stall-threshold-secs 20
 You can also persist these args in `.forgerc`:
 
 ```toml
-codex_pre_args = ["--sandbox", "danger-full-access"]
-thinking_mode = "summary" # off | summary | raw
+engine = "codex"
+engine_pre_args = ["--sandbox", "danger-full-access"]
+thinking_mode = "summary"
 ```
 
 To force a new clean loop session (ignore previous runtime/session artifacts):
@@ -180,7 +204,7 @@ To force a new clean loop session (ignore previous runtime/session artifacts):
 forge --cwd /absolute/path/to/project run --fresh
 ```
 
-`--fresh` clears runtime state files in `.forge/` and adds `--ephemeral` to Codex execution to avoid reusing old sessions.
+`--fresh` clears runtime state files in `.forge/` and adds `--ephemeral` to engine execution to avoid reusing old sessions.
 
 ## Analyze modified files
 
@@ -228,6 +252,19 @@ Fail if any operational warning remains:
 ```bash
 forge --cwd /absolute/path/to/project doctor --strict
 ```
+
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `FORGE_ENGINE` | Engine to use (`codex` or `opencode`) |
+| `FORGE_ENGINE_CMD` | Path to engine binary |
+| `FORGE_ENGINE_PRE_ARGS` | Pre-args for engine |
+| `FORGE_ENGINE_EXEC_ARGS` | Exec args for engine |
+| `FORGE_THINKING_MODE` | Thinking mode (`off`, `summary`, `raw`) |
+| `FORGE_MAX_CALLS_PER_HOUR` | Rate limit (default: 100) |
+| `FORGE_TIMEOUT_MINUTES` | Timeout per iteration (default: 15) |
+| `FORGE_RUNTIME_DIR` | Runtime directory (default: `.forge`) |
 
 ## License
 

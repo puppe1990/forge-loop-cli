@@ -36,7 +36,7 @@ impl ThinkingMode {
                 "--config".to_string(),
                 "show_raw_agent_reasoning=false".to_string(),
                 "--config".to_string(),
-                "model_reasoning_summary=\"none\"".to_string(),
+                r#"model_reasoning_summary="none""#.to_string(),
             ],
             ThinkingMode::Summary => vec![
                 "--config".to_string(),
@@ -44,7 +44,7 @@ impl ThinkingMode {
                 "--config".to_string(),
                 "show_raw_agent_reasoning=false".to_string(),
                 "--config".to_string(),
-                "model_reasoning_summary=\"concise\"".to_string(),
+                r#"model_reasoning_summary="concise""#.to_string(),
             ],
             ThinkingMode::Raw => vec![
                 "--config".to_string(),
@@ -52,17 +52,55 @@ impl ThinkingMode {
                 "--config".to_string(),
                 "show_raw_agent_reasoning=true".to_string(),
                 "--config".to_string(),
-                "model_reasoning_summary=\"detailed\"".to_string(),
+                r#"model_reasoning_summary="detailed""#.to_string(),
             ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EngineKind {
+    Codex,
+    OpenCode,
+}
+
+impl Default for EngineKind {
+    fn default() -> Self {
+        EngineKind::Codex
+    }
+}
+
+impl EngineKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EngineKind::Codex => "codex",
+            EngineKind::OpenCode => "opencode",
+        }
+    }
+
+    pub fn default_cmd(self) -> &'static str {
+        match self {
+            EngineKind::Codex => "codex",
+            EngineKind::OpenCode => "opencode",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "codex" => Some(EngineKind::Codex),
+            "opencode" => Some(EngineKind::OpenCode),
+            _ => None,
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct RunConfig {
-    pub codex_cmd: String,
-    pub codex_pre_args: Vec<String>,
-    pub codex_exec_args: Vec<String>,
+    pub engine: EngineKind,
+    pub engine_cmd: String,
+    pub engine_pre_args: Vec<String>,
+    pub engine_exec_args: Vec<String>,
     pub thinking_mode: ThinkingMode,
     pub max_calls_per_hour: u32,
     pub timeout_minutes: u64,
@@ -76,8 +114,9 @@ pub struct RunConfig {
 
 #[derive(Debug, Clone, Default)]
 pub struct CliOverrides {
-    pub codex_pre_args: Option<Vec<String>>,
-    pub codex_exec_args: Option<Vec<String>>,
+    pub engine: Option<EngineKind>,
+    pub engine_pre_args: Option<Vec<String>>,
+    pub engine_exec_args: Option<Vec<String>>,
     pub thinking_mode: Option<ThinkingMode>,
     pub max_calls_per_hour: Option<u32>,
     pub timeout_minutes: Option<u64>,
@@ -87,9 +126,10 @@ pub struct CliOverrides {
 
 #[derive(Debug, Deserialize, Default)]
 struct Forgerc {
-    codex_cmd: Option<String>,
-    codex_pre_args: Option<Vec<String>>,
-    codex_exec_args: Option<Vec<String>>,
+    engine: Option<String>,
+    engine_cmd: Option<String>,
+    engine_pre_args: Option<Vec<String>>,
+    engine_exec_args: Option<Vec<String>>,
     thinking_mode: Option<ThinkingMode>,
     max_calls_per_hour: Option<u32>,
     timeout_minutes: Option<u64>,
@@ -118,12 +158,19 @@ pub fn load_run_config(cwd: &Path, overrides: &CliOverrides) -> Result<RunConfig
         ResumeMode::New
     };
 
-    let codex_cmd = first_some(
-        env::var("FORGE_CODEX_CMD").ok(),
-        file_cfg.codex_cmd,
-        Some("codex".to_string()),
+    let engine = first_some(
+        overrides.engine,
+        env_engine("FORGE_ENGINE"),
+        file_cfg.engine.as_deref().and_then(EngineKind::from_str),
     )
-    .unwrap_or_else(|| "codex".to_string());
+    .unwrap_or_default();
+
+    let engine_cmd = first_some(
+        env::var("FORGE_ENGINE_CMD").ok(),
+        file_cfg.engine_cmd,
+        Some(engine.default_cmd().to_string()),
+    )
+    .unwrap_or_else(|| engine.default_cmd().to_string());
 
     let thinking_mode = first_some(
         overrides.thinking_mode,
@@ -132,18 +179,21 @@ pub fn load_run_config(cwd: &Path, overrides: &CliOverrides) -> Result<RunConfig
     )
     .unwrap_or(ThinkingMode::Summary);
 
-    let mut codex_pre_args = first_some(
-        overrides.codex_pre_args.clone(),
-        env_whitespace_args("FORGE_CODEX_PRE_ARGS"),
-        file_cfg.codex_pre_args,
+    let mut engine_pre_args = first_some(
+        overrides.engine_pre_args.clone(),
+        env_whitespace_args("FORGE_ENGINE_PRE_ARGS"),
+        file_cfg.engine_pre_args,
     )
     .unwrap_or_default();
-    codex_pre_args.extend(thinking_mode.codex_config_args());
 
-    let codex_exec_args = first_some(
-        overrides.codex_exec_args.clone(),
-        env_whitespace_args("FORGE_CODEX_EXEC_ARGS"),
-        file_cfg.codex_exec_args,
+    if engine == EngineKind::Codex {
+        engine_pre_args.extend(thinking_mode.codex_config_args());
+    }
+
+    let engine_exec_args = first_some(
+        overrides.engine_exec_args.clone(),
+        env_whitespace_args("FORGE_ENGINE_EXEC_ARGS"),
+        file_cfg.engine_exec_args,
     )
     .unwrap_or_default();
 
@@ -207,9 +257,10 @@ pub fn load_run_config(cwd: &Path, overrides: &CliOverrides) -> Result<RunConfig
     }
 
     Ok(RunConfig {
-        codex_cmd,
-        codex_pre_args,
-        codex_exec_args,
+        engine,
+        engine_cmd,
+        engine_pre_args,
+        engine_exec_args,
         thinking_mode,
         max_calls_per_hour,
         timeout_minutes,
@@ -279,4 +330,9 @@ fn env_thinking_mode(key: &str) -> Option<ThinkingMode> {
         "raw" => Some(ThinkingMode::Raw),
         _ => None,
     }
+}
+
+fn env_engine(key: &str) -> Option<EngineKind> {
+    let value = env::var(key).ok()?;
+    EngineKind::from_str(&value)
 }

@@ -16,6 +16,7 @@ serde.workspace = true
 chrono.workspace = true
 forge-config = { path = "../forge-config" }
 forge-core = { path = "../forge-core" }
+forge-engine = { path = "../forge-engine" }
 forge-monitor = { path = "../forge-monitor" }
 forge-types = { path = "../forge-types" }
 
