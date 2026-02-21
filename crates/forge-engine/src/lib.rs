@@ -1,8 +1,10 @@
+mod output_parser;
+
 use anyhow::{Context, Result};
 use chrono::Local;
 use forge_config::{EngineKind, ResumeMode, RunConfig, ThinkingMode};
 use forge_types::OutputAnalysis;
-use serde_json::Value;
+use output_parser::OutputParser;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -32,7 +34,9 @@ pub struct EngineExecParams<'a> {
 pub trait Engine {
     fn name(&self) -> &'static str;
     fn build_args(&self, params: &EngineExecParams) -> Vec<String>;
-    fn parse_output(&self, stdout: &str, stderr: &str, indicators: &[String]) -> OutputAnalysis;
+    fn parse_output(&self, stdout: &str, stderr: &str, indicators: &[String]) -> OutputAnalysis {
+        OutputParser::parse(stdout, stderr, indicators)
+    }
     fn is_available(&self) -> bool;
 }
 
@@ -49,10 +53,6 @@ impl Engine for CodexEngine {
         let mut args = params.config.engine_pre_args.clone();
         args.extend(self.build_exec_args(params));
         args
-    }
-
-    fn parse_output(&self, stdout: &str, stderr: &str, indicators: &[String]) -> OutputAnalysis {
-        parse_codex_output(stdout, stderr, indicators)
     }
 
     fn is_available(&self) -> bool {
@@ -73,10 +73,6 @@ impl Engine for OpenCodeEngine {
         let mut args = params.config.engine_pre_args.clone();
         args.extend(self.build_exec_args(params));
         args
-    }
-
-    fn parse_output(&self, stdout: &str, stderr: &str, indicators: &[String]) -> OutputAnalysis {
-        parse_opencode_output(stdout, stderr, indicators)
     }
 
     fn is_available(&self) -> bool {
@@ -318,116 +314,6 @@ where
     })
 }
 
-fn parse_codex_output(stdout: &str, stderr: &str, indicators: &[String]) -> OutputAnalysis {
-    let text = format!("{stdout}\n{stderr}");
-    let lowercase = text.to_ascii_lowercase();
-
-    let mut completion_count = 0_u32;
-    for item in indicators {
-        if text.contains(item) {
-            completion_count += 1;
-        }
-    }
-
-    let exit_signal_true = lowercase.contains("exit_signal: true");
-    let has_error = lowercase.contains("\"error\"") || lowercase.contains("error:");
-    let has_progress_hint = lowercase.contains("apply_patch")
-        || lowercase.contains("updated file")
-        || lowercase.contains("wrote")
-        || lowercase.contains("created")
-        || lowercase.contains("modified");
-
-    let mut session_id = None;
-    for line in stdout.lines() {
-        if let Ok(value) = serde_json::from_str::<Value>(line) {
-            if session_id.is_none() {
-                session_id = extract_session_id(&value);
-            }
-            if completion_count == 0 {
-                completion_count = indicators
-                    .iter()
-                    .filter(|needle| json_contains_string(&value, needle))
-                    .count() as u32;
-            }
-        }
-    }
-
-    OutputAnalysis {
-        exit_signal_true,
-        completion_indicators: completion_count,
-        has_error,
-        has_progress_hint,
-        session_id,
-    }
-}
-
-fn parse_opencode_output(stdout: &str, stderr: &str, indicators: &[String]) -> OutputAnalysis {
-    let text = format!("{stdout}\n{stderr}");
-    let lowercase = text.to_ascii_lowercase();
-
-    let mut completion_count = 0_u32;
-    for item in indicators {
-        if text.contains(item) {
-            completion_count += 1;
-        }
-    }
-
-    let exit_signal_true = lowercase.contains("exit_signal: true");
-    let has_error = lowercase.contains("\"error\"") || lowercase.contains("error:");
-    let has_progress_hint = lowercase.contains("apply_patch")
-        || lowercase.contains("updated file")
-        || lowercase.contains("wrote")
-        || lowercase.contains("created")
-        || lowercase.contains("modified");
-
-    let mut session_id = None;
-    for line in stdout.lines() {
-        if let Ok(value) = serde_json::from_str::<Value>(line) {
-            if session_id.is_none() {
-                session_id = extract_session_id(&value);
-            }
-            if completion_count == 0 {
-                completion_count = indicators
-                    .iter()
-                    .filter(|needle| json_contains_string(&value, needle))
-                    .count() as u32;
-            }
-        }
-    }
-
-    OutputAnalysis {
-        exit_signal_true,
-        completion_indicators: completion_count,
-        has_error,
-        has_progress_hint,
-        session_id,
-    }
-}
-
-fn extract_session_id(value: &Value) -> Option<String> {
-    match value {
-        Value::Object(map) => {
-            for key in ["session_id", "thread_id", "conversation_id", "id"] {
-                if let Some(Value::String(v)) = map.get(key) {
-                    return Some(v.clone());
-                }
-            }
-            map.values().find_map(extract_session_id)
-        }
-        Value::Array(arr) => arr.iter().find_map(extract_session_id),
-        _ => None,
-    }
-}
-
-fn json_contains_string(value: &Value, needle: &str) -> bool {
-    match value {
-        Value::String(s) => s.contains(needle),
-        Value::Array(arr) => arr.iter().any(|v| json_contains_string(v, needle)),
-        Value::Object(map) => map.values().any(|v| json_contains_string(v, needle)),
-        _ => false,
-    }
-}
-
 fn append_history(path: &Path, line: &str) -> Result<()> {
     let mut file = fs::OpenOptions::new()
         .create(true)
@@ -471,6 +357,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::overly_complex_bool_expr)]
     fn codex_engine_is_available_check() {
         let engine = CodexEngine;
         let result = engine.is_available();
@@ -478,6 +365,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::overly_complex_bool_expr)]
     fn opencode_engine_is_available_check() {
         let engine = OpenCodeEngine;
         let result = engine.is_available();
@@ -487,7 +375,7 @@ mod tests {
     #[test]
     fn parse_codex_output_detects_exit_signal() {
         let output = "EXIT_SIGNAL: true\nSTATUS: COMPLETE";
-        let analysis = parse_codex_output(output, "", &["STATUS: COMPLETE".into()]);
+        let analysis = CodexEngine.parse_output(output, "", &["STATUS: COMPLETE".into()]);
         assert!(analysis.exit_signal_true);
         assert_eq!(analysis.completion_indicators, 1);
     }
@@ -495,7 +383,31 @@ mod tests {
     #[test]
     fn parse_opencode_output_detects_session_id() {
         let output = r#"{"type":"thread.started","thread_id":"abc123"}"#;
-        let analysis = parse_opencode_output(output, "", &[]);
+        let analysis = OpenCodeEngine.parse_output(output, "", &[]);
         assert_eq!(analysis.session_id, Some("abc123".to_string()));
+    }
+
+    #[test]
+    fn codex_engine_name() {
+        let engine = CodexEngine;
+        assert_eq!(engine.name(), "codex");
+    }
+
+    #[test]
+    fn opencode_engine_name() {
+        let engine = OpenCodeEngine;
+        assert_eq!(engine.name(), "opencode");
+    }
+
+    #[test]
+    fn create_engine_returns_codex() {
+        let engine = create_engine(EngineKind::Codex);
+        assert_eq!(engine.name(), "codex");
+    }
+
+    #[test]
+    fn create_engine_returns_opencode() {
+        let engine = create_engine(EngineKind::OpenCode);
+        assert_eq!(engine.name(), "opencode");
     }
 }

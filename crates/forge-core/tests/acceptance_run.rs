@@ -22,7 +22,7 @@ fn run_completes_when_dual_gate_is_satisfied() {
 
     fs::write(
         dir.path().join(".forgerc"),
-        format!("codex_cmd = \"{}\"\n", script_path.display()),
+        format!("engine_cmd = \"{}\"\n", script_path.display()),
     )
     .expect("forgerc write");
 
@@ -53,7 +53,7 @@ fn run_with_fixed_max_loops_resets_counters_per_execution() {
 
     fs::write(
         dir.path().join(".forgerc"),
-        format!("codex_cmd = \"{}\"\n", script_path.display()),
+        format!("engine_cmd = \"{}\"\n", script_path.display()),
     )
     .expect("forgerc write");
 

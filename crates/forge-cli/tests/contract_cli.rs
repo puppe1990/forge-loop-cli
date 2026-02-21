@@ -29,7 +29,7 @@ fn run_help_shows_required_flags() {
     cmd.args(["run", "--help"])
         .assert()
         .success()
-        .stdout(contains("--codex-arg"))
+        .stdout(contains("--engine-arg"))
         .stdout(contains("--full-access"))
         .stdout(contains("--resume"))
         .stdout(contains("--resume-last"))
@@ -65,7 +65,7 @@ fn analyze_help_shows_flags() {
         .stdout(contains("--chunk-size"))
         .stdout(contains("--resume-latest-report"))
         .stdout(contains("--thinking"))
-        .stdout(contains("--codex-arg"))
+        .stdout(contains("--engine-arg"))
         .stdout(contains("--full-access"))
         .stdout(contains("--timeout-minutes"));
 }

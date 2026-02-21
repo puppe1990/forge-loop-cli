@@ -85,7 +85,7 @@ fn analyze_chunking_persists_latest_report() {
             "1",
             "--json",
         ])
-        .env("FORGE_CODEX_CMD", fake_codex.to_string_lossy().as_ref())
+        .env("FORGE_ENGINE_CMD", fake_codex.to_string_lossy().as_ref())
         .assert()
         .success()
         .get_output()
@@ -166,7 +166,7 @@ fn analyze_resume_latest_report_runs_only_synthesis() {
             "--resume-latest-report",
             "--json",
         ])
-        .env("FORGE_CODEX_CMD", fake_codex.to_string_lossy().as_ref())
+        .env("FORGE_ENGINE_CMD", fake_codex.to_string_lossy().as_ref())
         .assert()
         .success()
         .get_output()

@@ -58,17 +58,12 @@ impl ThinkingMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum EngineKind {
+    #[default]
     Codex,
     OpenCode,
-}
-
-impl Default for EngineKind {
-    fn default() -> Self {
-        EngineKind::Codex
-    }
 }
 
 impl EngineKind {
@@ -86,7 +81,7 @@ impl EngineKind {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn from_str_kind(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "codex" => Some(EngineKind::Codex),
             "opencode" => Some(EngineKind::OpenCode),
@@ -161,7 +156,10 @@ pub fn load_run_config(cwd: &Path, overrides: &CliOverrides) -> Result<RunConfig
     let engine = first_some(
         overrides.engine,
         env_engine("FORGE_ENGINE"),
-        file_cfg.engine.as_deref().and_then(EngineKind::from_str),
+        file_cfg
+            .engine
+            .as_deref()
+            .and_then(EngineKind::from_str_kind),
     )
     .unwrap_or_default();
 
@@ -334,5 +332,5 @@ fn env_thinking_mode(key: &str) -> Option<ThinkingMode> {
 
 fn env_engine(key: &str) -> Option<EngineKind> {
     let value = env::var(key).ok()?;
-    EngineKind::from_str(&value)
+    EngineKind::from_str_kind(&value)
 }
