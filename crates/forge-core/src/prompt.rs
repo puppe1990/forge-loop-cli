@@ -177,4 +177,59 @@ mod tests {
         assert!(prompt.contains("Task 79"));
         assert!(!prompt.contains("Task 80"));
     }
+
+    #[test]
+    fn build_plan_prompt_handles_whitespace_only_plan() {
+        let dir = tempdir().expect("tempdir");
+        let forge_dir = dir.path().join(".forge");
+        fs::create_dir_all(&forge_dir).expect("create .forge");
+        fs::write(forge_dir.join("plan.md"), "   \n\t\n").expect("write whitespace");
+
+        let result = build_plan_prompt(dir.path());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn analyze_plan_counts_x_as_checked() {
+        let dir = tempdir().expect("tempdir");
+        let forge_dir = dir.path().join(".forge");
+        fs::create_dir_all(&forge_dir).expect("create .forge");
+        fs::write(
+            forge_dir.join("plan.md"),
+            "# Plan\n- [x] Done\n- [X] Also Done\n- [ ] Not Done\n",
+        )
+        .expect("write plan");
+
+        let summary = analyze_plan(dir.path()).expect("summary");
+        assert_eq!(summary.checked_items, 1);
+        assert_eq!(summary.unchecked_items, 1);
+    }
+
+    #[test]
+    fn analyze_plan_handles_empty_plan() {
+        let dir = tempdir().expect("tempdir");
+        let forge_dir = dir.path().join(".forge");
+        fs::create_dir_all(&forge_dir).expect("create .forge");
+        fs::write(forge_dir.join("plan.md"), "# Plan\n").expect("write empty plan");
+
+        let summary = analyze_plan(dir.path()).expect("summary");
+        assert_eq!(summary.total_items, 0);
+    }
+
+    #[test]
+    fn build_plan_prompt_includes_continuity_message() {
+        let dir = tempdir().expect("tempdir");
+        let forge_dir = dir.path().join(".forge");
+        fs::create_dir_all(&forge_dir).expect("create .forge");
+        fs::write(forge_dir.join("plan.md"), "- [ ] Test\n").expect("write plan");
+        fs::write(
+            forge_dir.join("progress.json"),
+            r#"{"last_summary": "completed step 1"}"#,
+        )
+        .expect("write progress");
+
+        let prompt = build_plan_prompt(dir.path()).expect("prompt");
+        assert!(prompt.contains("Last loop summary:"));
+        assert!(prompt.contains("completed step 1"));
+    }
 }

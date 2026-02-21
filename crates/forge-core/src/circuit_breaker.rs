@@ -175,4 +175,78 @@ mod tests {
         assert!(cb.is_half_open());
         assert_eq!(cb.consecutive_no_progress(), 1);
     }
+
+    #[test]
+    fn zero_limit_opens_immediately() {
+        let mut cb = CircuitBreaker::new(0);
+
+        let action = cb.record_no_progress();
+
+        assert_eq!(action, CircuitBreakerAction::OpenCircuit);
+        assert!(cb.is_open());
+    }
+
+    #[test]
+    fn two_limit_opens_after_two_no_progress() {
+        let mut cb = CircuitBreaker::new(2);
+
+        cb.record_no_progress();
+        assert!(cb.is_half_open());
+
+        cb.record_no_progress();
+        assert!(cb.is_open());
+    }
+
+    #[test]
+    fn progress_closes_open_circuit() {
+        let mut cb = CircuitBreaker::new(1);
+
+        cb.record_no_progress();
+        assert!(cb.is_open());
+
+        let action = cb.record_progress();
+
+        assert_eq!(action, CircuitBreakerAction::Continue);
+        assert!(cb.is_closed());
+        assert_eq!(cb.consecutive_no_progress(), 0);
+    }
+
+    #[test]
+    fn from_state_with_open_circuit() {
+        let state = CircuitBreakerState {
+            state: CircuitState::Open,
+            consecutive_no_progress: 5,
+        };
+
+        let cb = CircuitBreaker::from_state(state, 10);
+
+        assert!(cb.is_open());
+        assert_eq!(cb.consecutive_no_progress(), 5);
+    }
+
+    #[test]
+    fn multiple_progress_calls_keep_closed() {
+        let mut cb = CircuitBreaker::new(3);
+
+        for _ in 0..10 {
+            cb.record_progress();
+        }
+
+        assert!(cb.is_closed());
+        assert_eq!(cb.consecutive_no_progress(), 0);
+    }
+
+    #[test]
+    fn no_progress_counter_saturates() {
+        let mut cb = CircuitBreaker::new(3);
+
+        cb.record_no_progress();
+        cb.record_no_progress();
+
+        assert_eq!(cb.consecutive_no_progress(), 2);
+
+        cb.record_no_progress();
+
+        assert_eq!(cb.consecutive_no_progress(), 3);
+    }
 }

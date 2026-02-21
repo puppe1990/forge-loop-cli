@@ -200,4 +200,80 @@ mod tests {
         assert!(path.exists());
         assert!(path.is_dir());
     }
+
+    #[test]
+    fn read_json_parses_valid_file() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("data.json");
+        let data = TestData {
+            name: "test".to_string(),
+            value: 42,
+        };
+
+        write_json(&path, &data).expect("write");
+        let read: TestData = read_json(&path).expect("read");
+
+        assert_eq!(read.name, "test");
+        assert_eq!(read.value, 42);
+    }
+
+    #[test]
+    fn read_json_fails_on_missing_file() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("missing.json");
+
+        let result: Result<TestData> = read_json(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn read_json_fails_on_invalid_json() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("invalid.json");
+        fs::write(&path, "not json").expect("write");
+
+        let result: Result<TestData> = read_json(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn append_history_handles_empty_string() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("log.txt");
+
+        append_history(&path, "").expect("append empty");
+
+        let content = fs::read_to_string(&path).expect("read");
+        assert!(content.is_empty());
+    }
+
+    #[test]
+    fn read_lines_reverse_handles_empty_file() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("empty.txt");
+        fs::write(&path, "").expect("write");
+
+        let lines = read_lines_reverse(&path, 10).expect("read");
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn read_lines_reverse_handles_only_whitespace() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("whitespace.txt");
+        fs::write(&path, "   \n   \n   \n").expect("write");
+
+        let lines = read_lines_reverse(&path, 10).expect("read");
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn ensure_dir_does_nothing_if_exists() {
+        let dir = tempdir().expect("tempdir");
+
+        ensure_dir(dir.path()).expect("first ensure");
+        ensure_dir(dir.path()).expect("second ensure");
+
+        assert!(dir.path().is_dir());
+    }
 }

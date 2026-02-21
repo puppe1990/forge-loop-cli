@@ -167,15 +167,29 @@ mod tests {
     }
 
     #[test]
-    fn returns_remaining_count() {
+    fn reset_at_exactly_one_hour() {
         let dir = tempdir().expect("tempdir");
-        let limiter = RateLimiter::new(10);
+        let limiter = RateLimiter::new(2);
 
-        let r1 = limiter.check_and_increment(dir.path(), 1000).expect("1");
-        assert_eq!(r1.remaining, 9);
+        limiter.check_and_increment(dir.path(), 1000).expect("1");
+        limiter.check_and_increment(dir.path(), 1001).expect("2");
 
-        let r2 = limiter.check_and_increment(dir.path(), 1001).expect("2");
-        assert_eq!(r2.remaining, 8);
+        let at_one_hour = limiter
+            .check_and_increment(dir.path(), 4600)
+            .expect("at one hour");
+        assert!(at_one_hour.allowed);
+        assert_eq!(at_one_hour.current_count, 1);
+
+        let after_one_hour = limiter
+            .check_and_increment(dir.path(), 5000)
+            .expect("after hour");
+        assert!(after_one_hour.allowed);
+        assert_eq!(after_one_hour.current_count, 2);
+
+        let over_limit = limiter
+            .check_and_increment(dir.path(), 5001)
+            .expect("over limit");
+        assert!(!over_limit.allowed);
     }
 
     #[test]
@@ -190,5 +204,41 @@ mod tests {
         let state = limiter2.get_state(dir.path()).expect("state");
 
         assert_eq!(state.count, 2);
+    }
+
+    #[test]
+    fn zero_limit_always_blocks() {
+        let dir = tempdir().expect("tempdir");
+        let limiter = RateLimiter::new(0);
+
+        let result = limiter
+            .check_and_increment(dir.path(), 1000)
+            .expect("check");
+
+        assert!(!result.allowed);
+        assert_eq!(result.current_count, 0);
+        assert_eq!(result.remaining, 0);
+    }
+
+    #[test]
+    fn saturating_sub_prevents_underflow() {
+        let dir = tempdir().expect("tempdir");
+        let limiter = RateLimiter::new(1);
+
+        limiter.check_and_increment(dir.path(), 1000).expect("1");
+
+        let result = limiter.check_and_increment(dir.path(), 1001).expect("2");
+        assert_eq!(result.remaining, 0);
+    }
+
+    #[test]
+    fn get_state_returns_default_for_missing_files() {
+        let dir = tempdir().expect("tempdir");
+        let limiter = RateLimiter::new(100);
+
+        let state = limiter.get_state(dir.path()).expect("state");
+
+        assert_eq!(state.count, 0);
+        assert_eq!(state.last_reset_epoch, 0);
     }
 }
