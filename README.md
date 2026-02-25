@@ -204,7 +204,14 @@ To force a new clean loop session (ignore previous runtime/session artifacts):
 forge --cwd /absolute/path/to/project run --fresh
 ```
 
-`--fresh` clears runtime state files in `.forge/` and adds `--ephemeral` to engine execution to avoid reusing old sessions.
+`--fresh` clears runtime state files in `.forge/`.
+For Codex engine, it also adds `--ephemeral` to avoid reusing old sessions.
+For OpenCode, runtime cleanup is applied without adding Codex-specific flags.
+
+`forge status` is engine-aware:
+
+- Codex: shows context and 5h/7d limit snapshots (when available)
+- OpenCode: shows `n/a (opencode)` for Codex-specific usage metrics
 
 ## Analyze modified files
 

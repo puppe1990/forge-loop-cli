@@ -394,7 +394,10 @@ fn render_activity_and_logs(runtime_dir: &Path) -> Paragraph<'static> {
             Span::raw(feed.source),
         ]),
         Line::from(vec![
-            Span::styled("codex_now: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}_now: ", feed.engine),
+                Style::default().fg(Color::DarkGray),
+            ),
             Span::styled(feed.current, Style::default().fg(Color::Cyan)),
         ]),
         Line::from(""),
@@ -454,6 +457,7 @@ fn style_for_event_kind(kind: &'static str) -> Style {
 #[derive(Debug)]
 struct LiveFeed {
     source: String,
+    engine: &'static str,
     current: String,
     recent: Vec<LogLine>,
 }
@@ -475,6 +479,7 @@ fn read_live_feed(runtime_dir: &Path) -> LiveFeed {
     let Some(path) = resolve_log_source(runtime_dir) else {
         return LiveFeed {
             source: "-".to_string(),
+            engine: "engine",
             current: "-".to_string(),
             recent: Vec::new(),
         };
@@ -485,16 +490,34 @@ fn read_live_feed(runtime_dir: &Path) -> LiveFeed {
         Err(_) => {
             return LiveFeed {
                 source: path.display().to_string(),
+                engine: "engine",
                 current: "-".to_string(),
                 recent: Vec::new(),
             }
         }
     };
+    let engine = detect_engine_from_log(&raw);
     LiveFeed {
         source: path.display().to_string(),
+        engine,
         current: extract_latest_activity(&raw).unwrap_or_else(|| "-".to_string()),
         recent: extract_recent_activity_lines(&raw, 14),
     }
+}
+
+fn detect_engine_from_log(raw: &str) -> &'static str {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("opencode run [message..]")
+        || lower.contains("\"sessionid\"")
+        || lower.contains("\"type\":\"step_start\"")
+        || lower.contains("\"type\":\"tool_use\"")
+    {
+        return "opencode";
+    }
+    if lower.contains("codex exec") || lower.contains("\"type\":\"thread.started\"") {
+        return "codex";
+    }
+    "engine"
 }
 
 fn resolve_log_source(runtime_dir: &Path) -> Option<PathBuf> {
@@ -520,6 +543,9 @@ fn extract_recent_activity_lines(raw: &str, limit: usize) -> Vec<LogLine> {
             continue;
         }
         let (line_time, normalized_line) = split_log_timestamp(trimmed);
+        if is_cli_help_noise(&normalized_line) {
+            continue;
+        }
         if is_state_db_discrepancy_warn(&normalized_line) {
             skipped_state_db_warns += 1;
             continue;
@@ -571,6 +597,9 @@ fn extract_latest_activity(raw: &str) -> Option<String> {
             continue;
         }
         let (_, normalized_line) = split_log_timestamp(trimmed);
+        if is_cli_help_noise(&normalized_line) {
+            continue;
+        }
         if is_state_db_discrepancy_warn(&normalized_line) {
             continue;
         }
@@ -591,6 +620,20 @@ fn extract_latest_activity(raw: &str) -> Option<String> {
         }
     }
     fallback
+}
+
+fn is_cli_help_noise(line: &str) -> bool {
+    let normalized = line.trim();
+    if normalized.is_empty() {
+        return true;
+    }
+    normalized == "opencode run [message..]"
+        || normalized == "run opencode with a message"
+        || normalized == "Positionals:"
+        || normalized == "Options:"
+        || normalized.contains("--help        show help")
+        || normalized.contains("--version     show version number")
+        || normalized.contains("--format      format: default (formatted) or json (raw JSON events)")
 }
 
 fn split_log_timestamp(line: &str) -> (Option<String>, String) {
@@ -694,6 +737,69 @@ fn classify_prefix_tag(line: &str) -> Option<&'static str> {
 }
 
 fn parse_activity_event(value: &Value) -> Option<ParsedActivity> {
+    if let Some(event_type) = value.get("type").and_then(Value::as_str) {
+        match event_type {
+            "step_start" => {
+                return Some(ParsedActivity {
+                    kind: Some("PROGRESS"),
+                    text: "agent: step started".to_string(),
+                });
+            }
+            "step_finish" => {
+                let reason = value
+                    .get("part")
+                    .and_then(|p| p.get("reason"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("-");
+                let kind = if reason == "stop" {
+                    Some("SUCCESS")
+                } else {
+                    Some("PROGRESS")
+                };
+                return Some(ParsedActivity {
+                    kind,
+                    text: format!("agent: step finished ({reason})"),
+                });
+            }
+            "text" => {
+                let text = value
+                    .get("part")
+                    .and_then(|p| p.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("-");
+                return Some(ParsedActivity {
+                    kind: Some("PROGRESS"),
+                    text: format!("agent: {}", text.chars().take(180).collect::<String>()),
+                });
+            }
+            "tool_use" => {
+                let part = value.get("part")?;
+                let tool = part.get("tool").and_then(Value::as_str).unwrap_or("tool");
+                let status = part
+                    .get("state")
+                    .and_then(|s| s.get("status"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("-");
+                let title = part
+                    .get("state")
+                    .and_then(|s| s.get("title"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(tool);
+                let kind = match status {
+                    "failed" => Some("FAILURE"),
+                    "completed" => Some("PROGRESS"),
+                    "in_progress" => Some("PROGRESS"),
+                    _ => Some("INFO"),
+                };
+                return Some(ParsedActivity {
+                    kind,
+                    text: format!("tool ({status}): {title}"),
+                });
+            }
+            _ => {}
+        }
+    }
+
     let item = value.get("item")?;
     let item_type = item.get("type")?.as_str()?;
 
@@ -1093,6 +1199,30 @@ plain text line
         let recent = extract_recent_activity_lines(raw, 5);
         assert!(!recent.is_empty());
         assert!(recent.iter().any(|line| line.kind == "LOOP"));
+    }
+
+    #[test]
+    fn parses_opencode_text_and_tool_events() {
+        let raw = r#"
+[14:00:00] {"type":"text","part":{"type":"text","text":"Working on it"}}
+[14:00:01] {"type":"tool_use","part":{"tool":"bash","state":{"status":"completed","title":"Run build"}}}
+"#;
+        let recent = extract_recent_activity_lines(raw, 5);
+        assert!(recent.iter().any(|line| line.text.contains("Working on it")));
+        assert!(recent.iter().any(|line| line.text.contains("Run build")));
+    }
+
+    #[test]
+    fn filters_opencode_help_noise() {
+        let raw = r#"
+[14:00:00] opencode run [message..]
+[14:00:01] Positionals:
+[14:00:02] Options:
+[14:00:03] {"type":"text","part":{"type":"text","text":"real message"}}
+"#;
+        let recent = extract_recent_activity_lines(raw, 5);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].text, "agent: real message");
     }
 
     #[test]

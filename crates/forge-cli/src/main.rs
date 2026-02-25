@@ -553,7 +553,7 @@ fn run_command(cmd: RunCommand, cwd: PathBuf) -> Result<()> {
     }
 
     let engine_pre_args = with_full_access_args(cmd.engine_pre_args.clone(), cmd.full_access);
-    let engine_exec_args = if cmd.fresh {
+    let engine_exec_args = if cmd.fresh && matches!(cmd.engine, EngineArg::Codex) {
         Some(vec!["--ephemeral".to_string()])
     } else {
         None
@@ -1121,9 +1121,12 @@ fn status_command(cmd: StatusCommand, cwd: PathBuf) -> Result<()> {
     let runtime_dir = cwd.join(cfg.runtime_dir);
     let status = read_status(&runtime_dir)?;
     let session_id = infer_session_id(&runtime_dir, &status);
-    let usage = session_id
-        .as_deref()
-        .and_then(read_codex_usage_for_session_id);
+    let usage = match cfg.engine {
+        EngineKind::Codex => session_id
+            .as_deref()
+            .and_then(read_codex_usage_for_session_id),
+        EngineKind::OpenCode => None,
+    };
 
     if cmd.json {
         let mut out = serde_json::json!({
@@ -1147,6 +1150,7 @@ fn status_command(cmd: StatusCommand, cwd: PathBuf) -> Result<()> {
         };
 
         println!("state: {}", status.state);
+        println!("engine: {}", cfg.engine.as_str());
         println!("thinking_mode: {}", status.thinking_mode);
         println!("run_timer: {}", run_timer);
         println!("current_loop: {}", status.current_loop);
@@ -1162,25 +1166,31 @@ fn status_command(cmd: StatusCommand, cwd: PathBuf) -> Result<()> {
             "session_id: {}",
             session_id.unwrap_or_else(|| "-".to_string())
         );
-        println!("context: {}", format_context_line(usage.as_ref()));
-        println!(
-            "5h limit: {}",
-            format_limit_line(
-                usage.as_ref().and_then(|u| u.five_hour_left_percent),
-                usage
-                    .as_ref()
-                    .and_then(|u| u.five_hour_resets_at.as_deref())
-            )
-        );
-        println!(
-            "7d limit: {}",
-            format_limit_line(
-                usage.as_ref().and_then(|u| u.seven_day_left_percent),
-                usage
-                    .as_ref()
-                    .and_then(|u| u.seven_day_resets_at.as_deref())
-            )
-        );
+        if cfg.engine == EngineKind::Codex {
+            println!("context: {}", format_context_line(usage.as_ref()));
+            println!(
+                "5h limit: {}",
+                format_limit_line(
+                    usage.as_ref().and_then(|u| u.five_hour_left_percent),
+                    usage
+                        .as_ref()
+                        .and_then(|u| u.five_hour_resets_at.as_deref())
+                )
+            );
+            println!(
+                "7d limit: {}",
+                format_limit_line(
+                    usage.as_ref().and_then(|u| u.seven_day_left_percent),
+                    usage
+                        .as_ref()
+                        .and_then(|u| u.seven_day_resets_at.as_deref())
+                )
+            );
+        } else {
+            println!("context: n/a (opencode)");
+            println!("5h limit: n/a (opencode)");
+            println!("7d limit: n/a (opencode)");
+        }
         println!("updated_at_epoch: {}", status.updated_at_epoch);
     }
     Ok(())
@@ -1199,7 +1209,7 @@ struct CodexUsageSnapshot {
 
 fn infer_session_id(runtime_dir: &Path, status: &forge_types::RunStatus) -> Option<String> {
     if let Some(session_id) = status.session_id.clone() {
-        if !session_id.trim().is_empty() {
+        if !session_id.trim().is_empty() && is_likely_engine_session_id(&session_id) {
             return Some(session_id);
         }
     }
@@ -1211,14 +1221,34 @@ fn infer_session_id(runtime_dir: &Path, status: &forge_types::RunStatus) -> Opti
         let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
             continue;
         };
-        if value.get("type").and_then(Value::as_str) == Some("thread.started") {
-            if let Some(thread_id) = value.get("thread_id").and_then(Value::as_str) {
-                if !thread_id.trim().is_empty() {
-                    return Some(thread_id.to_string());
-                }
+        if let Some(found) = infer_session_id_from_value(&value) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn is_likely_engine_session_id(session_id: &str) -> bool {
+    session_id.starts_with("ses_")
+        || session_id.starts_with("thread_")
+        || session_id.starts_with("conv_")
+}
+
+fn infer_session_id_from_value(value: &Value) -> Option<String> {
+    if value.get("type").and_then(Value::as_str) == Some("thread.started") {
+        if let Some(thread_id) = value.get("thread_id").and_then(Value::as_str) {
+            if !thread_id.trim().is_empty() {
+                return Some(thread_id.to_string());
             }
         }
     }
+
+    if let Some(session_id) = value.get("sessionID").and_then(Value::as_str) {
+        if !session_id.trim().is_empty() {
+            return Some(session_id.to_string());
+        }
+    }
+
     None
 }
 
@@ -1800,7 +1830,8 @@ fn format_duration(total_secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::with_full_access_args;
+    use super::{infer_session_id_from_value, is_likely_engine_session_id, with_full_access_args};
+    use serde_json::json;
 
     #[test]
     fn full_access_adds_danger_sandbox_when_missing() {
@@ -1836,5 +1867,36 @@ mod tests {
                 "danger-full-access".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn infer_session_id_from_codex_thread_started() {
+        let value = json!({
+            "type": "thread.started",
+            "thread_id": "thread_123"
+        });
+        assert_eq!(
+            infer_session_id_from_value(&value),
+            Some("thread_123".to_string())
+        );
+    }
+
+    #[test]
+    fn infer_session_id_from_opencode_event() {
+        let value = json!({
+            "type": "step_start",
+            "sessionID": "ses_abc"
+        });
+        assert_eq!(
+            infer_session_id_from_value(&value),
+            Some("ses_abc".to_string())
+        );
+    }
+
+    #[test]
+    fn session_id_filter_rejects_part_ids() {
+        assert!(is_likely_engine_session_id("ses_abc"));
+        assert!(is_likely_engine_session_id("thread_abc"));
+        assert!(!is_likely_engine_session_id("prt_abc"));
     }
 }

@@ -119,7 +119,8 @@ impl OpenCodeEngine {
     fn build_exec_args(&self, params: &EngineExecParams) -> Vec<String> {
         let mut args = vec!["run".into()];
         args.extend(params.config.engine_exec_args.iter().cloned());
-        args.push("--json".into());
+        args.push("--format".into());
+        args.push("json".into());
 
         if params.config.thinking_mode == ThinkingMode::Off {
             args.push("--config".into());
@@ -127,7 +128,6 @@ impl OpenCodeEngine {
         }
 
         if let Some(prompt) = &params.prompt {
-            args.push("--prompt".into());
             args.push(prompt.clone());
         }
 
