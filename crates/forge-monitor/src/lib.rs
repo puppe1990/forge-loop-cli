@@ -499,11 +499,24 @@ fn read_live_feed(runtime_dir: &Path) -> LiveFeed {
         }
     };
     let engine = detect_engine(runtime_dir, Some(&raw));
+    let scoped_raw = scope_live_log_to_active_run(&raw, engine);
     LiveFeed {
         source: path.display().to_string(),
         engine,
-        current: extract_latest_activity(&raw).unwrap_or_else(|| "-".to_string()),
-        recent: extract_recent_activity_lines(&raw, 14),
+        current: extract_latest_activity(&scoped_raw).unwrap_or_else(|| "-".to_string()),
+        recent: extract_recent_activity_lines(&scoped_raw, 14),
+    }
+}
+
+fn scope_live_log_to_active_run(raw: &str, engine: &str) -> String {
+    let marker = format!("{engine} exec started");
+    let lines = raw.lines().collect::<Vec<_>>();
+    let start_idx = lines
+        .iter()
+        .rposition(|line| line.to_ascii_lowercase().contains(&marker));
+    match start_idx {
+        Some(idx) => lines[idx..].join("\n"),
+        None => raw.to_string(),
     }
 }
 
@@ -834,11 +847,15 @@ fn parse_activity_event(value: &Value) -> Option<ParsedActivity> {
                     .and_then(|s| s.get("status"))
                     .and_then(Value::as_str)
                     .unwrap_or("-");
-                let title = part
+                let mut title = part
                     .get("state")
                     .and_then(|s| s.get("title"))
                     .and_then(Value::as_str)
-                    .unwrap_or(tool);
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| tool.to_string());
+                if let Some(detail) = summarize_tool_detail(part, tool) {
+                    title = detail;
+                }
                 let kind = match status {
                     "failed" => Some("FAILURE"),
                     "completed" => Some("PROGRESS"),
@@ -847,7 +864,7 @@ fn parse_activity_event(value: &Value) -> Option<ParsedActivity> {
                 };
                 return Some(ParsedActivity {
                     kind,
-                    text: format!("tool ({status}): {title}"),
+                    text: format!("tool ({status}): {}", title.chars().take(180).collect::<String>()),
                 });
             }
             _ => {}
@@ -889,6 +906,34 @@ fn parse_activity_event(value: &Value) -> Option<ParsedActivity> {
     }
 
     None
+}
+
+fn summarize_tool_detail(part: &Value, tool: &str) -> Option<String> {
+    let input = part.get("state")?.get("input")?;
+    match tool {
+        "bash" | "command" => {
+            let command = input
+                .get("command")
+                .and_then(Value::as_str)
+                .or_else(|| input.get("cmd").and_then(Value::as_str))?;
+            Some(format!("{}: {}", tool, command.chars().take(120).collect::<String>()))
+        }
+        "read" => {
+            let file_path = input
+                .get("filePath")
+                .or_else(|| input.get("path"))
+                .and_then(Value::as_str)?;
+            Some(format!("read: {}", file_path.chars().take(120).collect::<String>()))
+        }
+        "write" | "edit" => {
+            let file_path = input
+                .get("filePath")
+                .or_else(|| input.get("path"))
+                .and_then(Value::as_str)?;
+            Some(format!("{}: {}", tool, file_path.chars().take(120).collect::<String>()))
+        }
+        _ => None,
+    }
 }
 
 fn epoch_now() -> u64 {
@@ -1288,6 +1333,19 @@ plain text line
         let recent = extract_recent_activity_lines(raw, 5);
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].text, "agent: real work");
+    }
+
+    #[test]
+    fn scopes_recent_activity_to_active_run() {
+        let raw = r#"
+[15:10:36] {"item":{"type":"agent_message","text":"loop 2: codex exec failed"}}
+[15:12:58] {"item":{"type":"agent_message","text":"loop 1: opencode exec started"}}
+[15:13:11] {"type":"tool_use","part":{"tool":"bash","state":{"status":"completed","input":{"command":"ls -la"}}}}
+"#;
+        let scoped = scope_live_log_to_active_run(raw, "opencode");
+        let recent = extract_recent_activity_lines(&scoped, 5);
+        assert!(!recent.iter().any(|line| line.text.contains("codex exec failed")));
+        assert!(recent.iter().any(|line| line.text.contains("bash: ls -la")));
     }
 
     #[test]
