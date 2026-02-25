@@ -151,8 +151,10 @@ fn render_status(
     let usage = session_id
         .as_deref()
         .and_then(read_codex_usage_for_session_id);
+    let engine = detect_engine(runtime_dir, None);
 
     let mut lines = vec![
+        Line::from(format!("engine: {}", engine)),
         Line::from(format!("state: {}", status.state)),
         Line::from(format!("thinking_mode: {}", status.thinking_mode)),
         Line::from(format!(
@@ -391,14 +393,14 @@ fn render_activity_and_logs(runtime_dir: &Path) -> Paragraph<'static> {
     let mut lines: Vec<Line<'static>> = vec![
         Line::from(vec![
             Span::styled("source: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(feed.source),
+            Span::raw(compact_source_path(&feed.source, 88)),
         ]),
         Line::from(vec![
+            Span::styled("engine_now: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{}_now: ", feed.engine),
-                Style::default().fg(Color::DarkGray),
+                format!("{}: {}", feed.engine, feed.current),
+                Style::default().fg(Color::Cyan),
             ),
-            Span::styled(feed.current, Style::default().fg(Color::Cyan)),
         ]),
         Line::from(""),
         Line::from(Span::styled(
@@ -496,7 +498,7 @@ fn read_live_feed(runtime_dir: &Path) -> LiveFeed {
             }
         }
     };
-    let engine = detect_engine_from_log(&raw);
+    let engine = detect_engine(runtime_dir, Some(&raw));
     LiveFeed {
         source: path.display().to_string(),
         engine,
@@ -505,7 +507,23 @@ fn read_live_feed(runtime_dir: &Path) -> LiveFeed {
     }
 }
 
-fn detect_engine_from_log(raw: &str) -> &'static str {
+fn detect_engine(runtime_dir: &Path, raw: Option<&str>) -> &'static str {
+    // Prefer explicit config from project root.
+    if let Some(project_dir) = runtime_dir.parent() {
+        let forgerc = project_dir.join(".forgerc");
+        if let Ok(cfg) = fs::read_to_string(forgerc) {
+            let lower = cfg.to_ascii_lowercase();
+            if lower.contains("engine") && lower.contains("opencode") {
+                return "opencode";
+            }
+            if lower.contains("engine") && lower.contains("codex") {
+                return "codex";
+            }
+        }
+    }
+    let Some(raw) = raw else {
+        return "engine";
+    };
     let lower = raw.to_ascii_lowercase();
     if lower.contains("opencode run [message..]")
         || lower.contains("\"sessionid\"")
@@ -518,6 +536,22 @@ fn detect_engine_from_log(raw: &str) -> &'static str {
         return "codex";
     }
     "engine"
+}
+
+fn compact_source_path(path: &str, max_chars: usize) -> String {
+    if path.chars().count() <= max_chars {
+        return path.to_string();
+    }
+    let tail_len = max_chars.saturating_sub(3);
+    let tail: String = path
+        .chars()
+        .rev()
+        .take(tail_len)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("...{}", tail)
 }
 
 fn resolve_log_source(runtime_dir: &Path) -> Option<PathBuf> {
@@ -554,6 +588,9 @@ fn extract_recent_activity_lines(raw: &str, limit: usize) -> Vec<LogLine> {
             let Some(parsed) = parse_activity_event(&value) else {
                 continue;
             };
+            if is_noisy_loop_activity(parsed.text.as_str()) {
+                continue;
+            }
             let label = parsed
                 .kind
                 .unwrap_or_else(|| classify_log_event(parsed.text.as_str()));
@@ -564,6 +601,9 @@ fn extract_recent_activity_lines(raw: &str, limit: usize) -> Vec<LogLine> {
             });
         } else {
             let normalized: String = normalized_line.chars().take(180).collect();
+            if is_noisy_loop_activity(normalized.as_str()) {
+                continue;
+            }
             let label = classify_log_event(&normalized);
             out.push(LogLine {
                 kind: label,
@@ -606,6 +646,9 @@ fn extract_latest_activity(raw: &str) -> Option<String> {
 
         if let Ok(value) = serde_json::from_str::<Value>(&normalized_line) {
             if let Some(parsed) = parse_activity_event(&value) {
+                if is_noisy_loop_activity(parsed.text.as_str()) {
+                    continue;
+                }
                 return Some(parsed.text);
             }
             continue;
@@ -614,12 +657,23 @@ fn extract_latest_activity(raw: &str) -> Option<String> {
         if normalized_line.starts_with("202") {
             continue;
         }
+        if is_noisy_loop_activity(normalized_line.as_str()) {
+            continue;
+        }
 
         if fallback.is_none() {
             fallback = Some(normalized_line.chars().take(180).collect());
         }
     }
     fallback
+}
+
+fn is_noisy_loop_activity(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("agent: loop ")
+        && (lower.contains(" exec started")
+            || lower.contains(" exec completed")
+            || lower.contains(" exec failed"))
 }
 
 fn is_cli_help_noise(line: &str) -> bool {
@@ -1198,7 +1252,7 @@ plain text line
 "#;
         let recent = extract_recent_activity_lines(raw, 5);
         assert!(!recent.is_empty());
-        assert!(recent.iter().any(|line| line.kind == "LOOP"));
+        assert!(recent.iter().any(|line| line.text.contains("plain text line")));
     }
 
     #[test]
@@ -1223,6 +1277,17 @@ plain text line
         let recent = extract_recent_activity_lines(raw, 5);
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].text, "agent: real message");
+    }
+
+    #[test]
+    fn filters_noisy_loop_activity_lines() {
+        let raw = r#"
+[14:00:00] {"item":{"type":"agent_message","text":"loop 1: opencode exec started"}}
+[14:00:01] {"type":"text","part":{"type":"text","text":"real work"}}
+"#;
+        let recent = extract_recent_activity_lines(raw, 5);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].text, "agent: real work");
     }
 
     #[test]
