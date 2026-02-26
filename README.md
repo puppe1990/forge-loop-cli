@@ -45,6 +45,8 @@ engine = "opencode"
 ## Commands
 
 - `forge` (interactive assistant mode: asks SDD questions, writes plan/specs, then runs loop)
+- `forge menu` (menu interativo para selecionar ações principais)
+- `forge prd [--engine codex|opencode] [--run] [--full-access]` (creates PRD/SDD artifacts; use `--run` to execute immediately)
 - `forge run [--engine codex|opencode] [--full-access] [--thinking off|summary|raw] [--max-loops N] [--timeout-minutes N]`
 - `forge analyze [--engine codex|opencode] --modified-only`
 - `forge status`
@@ -74,6 +76,31 @@ It generates:
 - `docs/specs/session/scenarios.md`
 
 Then it executes `forge run` in loop mode automatically.
+
+## Interactive Menu
+
+Use the interactive menu to choose what to do (PRD, run, analyze, status, monitor, doctor, SDD list/load):
+
+```bash
+forge --cwd /absolute/path/to/project menu
+```
+
+The menu also supports letter shortcuts (for example `r` = run, `a` = analyze, `q` = exit)
+and preset profiles for `run` / `analyze` (`quick`, `balanced`, `deep`, `custom`).
+
+To create only the PRD/SDD artifacts (without starting the loop), use:
+
+```bash
+forge --cwd /absolute/path/to/project prd
+forge --cwd /absolute/path/to/project prd --engine opencode
+```
+
+To create and immediately run with a chosen engine:
+
+```bash
+forge --cwd /absolute/path/to/project prd --run --engine codex
+forge --cwd /absolute/path/to/project prd --run --engine opencode
+```
 
 ## Reuse Existing SDDs
 

@@ -20,6 +20,8 @@ fn help_shows_subcommands() {
         .stdout(contains("doctor"))
         .stdout(contains("status"))
         .stdout(contains("monitor"))
+        .stdout(contains("menu"))
+        .stdout(contains("prd"))
         .stdout(contains("sdd"));
 }
 
@@ -79,6 +81,27 @@ fn doctor_help_shows_json_flag() {
         .stdout(contains("--json"))
         .stdout(contains("--fix"))
         .stdout(contains("--strict"));
+}
+
+#[test]
+fn menu_help_is_available() {
+    let mut cmd = forge_cmd();
+    cmd.args(["menu", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("Usage:"))
+        .stdout(contains("forge menu"));
+}
+
+#[test]
+fn prd_help_shows_engine_and_run_flags() {
+    let mut cmd = forge_cmd();
+    cmd.args(["prd", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--engine"))
+        .stdout(contains("--run"))
+        .stdout(contains("--full-access"));
 }
 
 #[test]

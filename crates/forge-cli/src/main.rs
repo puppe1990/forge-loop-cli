@@ -35,6 +35,8 @@ enum Commands {
     Doctor(DoctorCommand),
     Status(StatusCommand),
     Monitor(MonitorCommand),
+    Menu(MenuCommand),
+    Prd(PrdCommand),
     Sdd(SddCommand),
 }
 
@@ -131,6 +133,21 @@ struct DoctorCommand {
     strict: bool,
 }
 
+#[derive(Debug, clap::Args, Default)]
+struct MenuCommand {}
+
+#[derive(Debug, clap::Args)]
+struct PrdCommand {
+    #[arg(long, value_enum, default_value = "codex")]
+    engine: EngineArg,
+
+    #[arg(long)]
+    run: bool,
+
+    #[arg(long)]
+    full_access: bool,
+}
+
 #[derive(Debug, clap::Args)]
 struct SddCommand {
     #[command(subcommand)]
@@ -186,6 +203,15 @@ impl From<EngineArg> for EngineKind {
     }
 }
 
+impl EngineArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            EngineArg::Codex => "codex",
+            EngineArg::OpenCode => "opencode",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SddInterview {
     project_name: String,
@@ -211,6 +237,8 @@ fn main() -> Result<()> {
         Some(Commands::Doctor(cmd)) => doctor_command(cmd, cwd),
         Some(Commands::Status(cmd)) => status_command(cmd, cwd),
         Some(Commands::Monitor(cmd)) => monitor_command(cmd, cwd),
+        Some(Commands::Menu(cmd)) => menu_command(cmd, cwd),
+        Some(Commands::Prd(cmd)) => prd_command(cmd, cwd),
         Some(Commands::Sdd(cmd)) => sdd_command(cmd, cwd),
         None => assistant_mode(cwd),
     }
@@ -219,6 +247,171 @@ fn main() -> Result<()> {
 fn assistant_mode(cwd: PathBuf) -> Result<()> {
     println!("forge assistant mode");
     println!("answer the SDD questions. forge will generate specs and run the loop.\n");
+
+    create_prd_and_maybe_run(
+        cwd,
+        PrdCommand {
+            engine: EngineArg::Codex,
+            run: true,
+            full_access: false,
+        },
+        true,
+    )
+}
+
+fn prd_command(cmd: PrdCommand, cwd: PathBuf) -> Result<()> {
+    println!("forge prd");
+    println!("answer the SDD questions. forge will generate PRD/SDD artifacts.\n");
+    create_prd_and_maybe_run(cwd, cmd, false)
+}
+
+fn menu_command(_cmd: MenuCommand, cwd: PathBuf) -> Result<()> {
+    loop {
+        println!("\nforge menu ({})", cwd.display());
+        println!("1) PRD/SDD (create only)      [p]");
+        println!("2) PRD/SDD + run              [P]");
+        println!("3) Run active plan            [r]");
+        println!("4) Analyze modified files     [a]");
+        println!("5) Status                     [s]");
+        println!("6) Monitor                    [m]");
+        println!("7) Doctor                     [d]");
+        println!("8) SDD list                   [l]");
+        println!("9) SDD load                   [o]");
+        println!("0) Exit                       [q]");
+
+        let choice = ask("select option", "0")?;
+        match choice.trim() {
+            "1" | "p" => {
+                let engine = ask_engine(EngineArg::Codex)?;
+                prd_command(
+                    PrdCommand {
+                        engine,
+                        run: false,
+                        full_access: false,
+                    },
+                    cwd.clone(),
+                )?;
+            }
+            "2" | "P" => {
+                let engine = ask_engine(EngineArg::Codex)?;
+                let full_access = ask_yes_no("full access", false)?;
+                prd_command(
+                    PrdCommand {
+                        engine,
+                        run: true,
+                        full_access,
+                    },
+                    cwd.clone(),
+                )?;
+            }
+            "3" | "r" => {
+                let engine = ask_engine(EngineArg::Codex)?;
+                let full_access = ask_yes_no("full access", false)?;
+                let preset = ask_run_preset()?;
+                run_command(
+                    RunCommand {
+                        engine,
+                        engine_pre_args: Vec::new(),
+                        full_access,
+                        thinking: Some(preset.thinking),
+                        resume: None,
+                        resume_last: false,
+                        fresh: false,
+                        max_calls_per_hour: None,
+                        timeout_minutes: preset.timeout_minutes,
+                        json: false,
+                        max_loops: preset.max_loops,
+                    },
+                    cwd.clone(),
+                )?;
+            }
+            "4" | "a" => {
+                let engine = ask_engine(EngineArg::Codex)?;
+                let full_access = ask_yes_no("full access", false)?;
+                let preset = ask_analyze_preset()?;
+                analyze_command(
+                    AnalyzeCommand {
+                        engine,
+                        engine_pre_args: Vec::new(),
+                        full_access,
+                        thinking: Some(preset.thinking),
+                        modified_only: true,
+                        chunk_size: preset.chunk_size,
+                        resume_latest_report: false,
+                        timeout_minutes: preset.timeout_minutes,
+                        json: false,
+                    },
+                    cwd.clone(),
+                )?;
+            }
+            "5" | "s" => {
+                status_command(StatusCommand { json: false }, cwd.clone())?;
+            }
+            "6" | "m" => {
+                let refresh_ms = ask("refresh ms", "500")?
+                    .trim()
+                    .parse::<u64>()
+                    .unwrap_or(500);
+                let stall_threshold_secs = ask("stall threshold secs", "15")?
+                    .trim()
+                    .parse::<u64>()
+                    .unwrap_or(15);
+                monitor_command(
+                    MonitorCommand {
+                        refresh_ms,
+                        stall_threshold_secs,
+                    },
+                    cwd.clone(),
+                )?;
+            }
+            "7" | "d" => {
+                let fix = ask_yes_no("apply fixes", false)?;
+                let strict = ask_yes_no("strict mode", false)?;
+                doctor_command(
+                    DoctorCommand {
+                        json: false,
+                        fix,
+                        strict,
+                    },
+                    cwd.clone(),
+                )?;
+            }
+            "8" | "l" => {
+                sdd_command(
+                    SddCommand {
+                        action: SddAction::List(SddListCommand { json: false }),
+                    },
+                    cwd.clone(),
+                )?;
+            }
+            "9" | "o" => {
+                let id = ask("sdd id", "")?;
+                if id.trim().is_empty() {
+                    println!("sdd id is required");
+                    continue;
+                }
+                sdd_command(
+                    SddCommand {
+                        action: SddAction::Load(SddLoadCommand { id }),
+                    },
+                    cwd.clone(),
+                )?;
+            }
+            "0" | "q" => {
+                println!("bye");
+                return Ok(());
+            }
+            _ => println!("invalid option"),
+        }
+    }
+}
+
+fn create_prd_and_maybe_run(
+    cwd: PathBuf,
+    cmd: PrdCommand,
+    started_from_assistant_mode: bool,
+) -> Result<()> {
+    let selected_engine = cmd.engine;
 
     let answers = collect_sdd_answers()?;
     let sdd_id = create_sdd_snapshot(&cwd, &answers)?;
@@ -231,13 +424,25 @@ fn assistant_mode(cwd: PathBuf) -> Result<()> {
     println!("- docs/specs/session/acceptance.md");
     println!("- docs/specs/session/scenarios.md");
     println!("\nUse `forge sdd list` and `forge sdd load <id>` to switch plans.");
-    println!("\nstarting loop...\n");
+
+    if !cmd.run {
+        if !started_from_assistant_mode {
+            println!(
+                "\nPRD/SDD created only (no execution). To run with {}: forge run --engine {}",
+                selected_engine.as_str(),
+                selected_engine.as_str()
+            );
+        }
+        return Ok(());
+    }
+
+    println!("\nstarting loop with {}...\n", selected_engine.as_str());
 
     run_command(
         RunCommand {
-            engine: EngineArg::Codex,
+            engine: selected_engine,
             engine_pre_args: Vec::new(),
-            full_access: false,
+            full_access: cmd.full_access,
             thinking: Some(answers.thinking),
             resume: None,
             resume_last: false,
@@ -398,6 +603,147 @@ fn ask_thinking(label: &str, default: ThinkingArg) -> Result<ThinkingArg> {
             _ => {
                 println!("invalid thinking mode. use: off | summary | raw");
             }
+        }
+    }
+}
+
+fn ask_engine(default: EngineArg) -> Result<EngineArg> {
+    let default_str = default.as_str();
+    loop {
+        let value = ask("engine (codex/opencode)", default_str)?;
+        match value.trim().to_ascii_lowercase().as_str() {
+            "codex" => return Ok(EngineArg::Codex),
+            "opencode" => return Ok(EngineArg::OpenCode),
+            _ => println!("invalid engine. use: codex | opencode"),
+        }
+    }
+}
+
+fn ask_yes_no(label: &str, default: bool) -> Result<bool> {
+    let default_str = if default { "y" } else { "n" };
+    loop {
+        let value = ask(&format!("{label} (y/n)"), default_str)?;
+        match value.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => println!("invalid answer. use: y | n"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RunPreset {
+    thinking: ThinkingArg,
+    timeout_minutes: Option<u64>,
+    max_loops: u64,
+}
+
+fn ask_run_preset() -> Result<RunPreset> {
+    println!("run presets: [q] quick, [b] balanced, [d] deep, [c] custom");
+    loop {
+        let choice = ask("run preset", "b")?;
+        match choice.trim().to_ascii_lowercase().as_str() {
+            "q" | "quick" => {
+                return Ok(RunPreset {
+                    thinking: ThinkingArg::Off,
+                    timeout_minutes: Some(10),
+                    max_loops: 40,
+                });
+            }
+            "b" | "balanced" => {
+                return Ok(RunPreset {
+                    thinking: ThinkingArg::Summary,
+                    timeout_minutes: Some(20),
+                    max_loops: 100,
+                });
+            }
+            "d" | "deep" => {
+                return Ok(RunPreset {
+                    thinking: ThinkingArg::Raw,
+                    timeout_minutes: Some(45),
+                    max_loops: 200,
+                });
+            }
+            "c" | "custom" => {
+                let thinking = ask_thinking("thinking mode", ThinkingArg::Summary)?;
+                let timeout = ask_optional_u64("timeout minutes (blank = none)", None)?;
+                let max_loops = ask("max loops", "100")?
+                    .trim()
+                    .parse::<u64>()
+                    .unwrap_or(100);
+                return Ok(RunPreset {
+                    thinking,
+                    timeout_minutes: timeout,
+                    max_loops,
+                });
+            }
+            _ => println!("invalid preset. use: q | b | d | c"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AnalyzePreset {
+    thinking: ThinkingArg,
+    timeout_minutes: Option<u64>,
+    chunk_size: usize,
+}
+
+fn ask_analyze_preset() -> Result<AnalyzePreset> {
+    println!("analyze presets: [q] quick, [b] balanced, [d] deep, [c] custom");
+    loop {
+        let choice = ask("analyze preset", "b")?;
+        match choice.trim().to_ascii_lowercase().as_str() {
+            "q" | "quick" => {
+                return Ok(AnalyzePreset {
+                    thinking: ThinkingArg::Off,
+                    timeout_minutes: Some(8),
+                    chunk_size: 15,
+                });
+            }
+            "b" | "balanced" => {
+                return Ok(AnalyzePreset {
+                    thinking: ThinkingArg::Summary,
+                    timeout_minutes: Some(15),
+                    chunk_size: 25,
+                });
+            }
+            "d" | "deep" => {
+                return Ok(AnalyzePreset {
+                    thinking: ThinkingArg::Raw,
+                    timeout_minutes: Some(30),
+                    chunk_size: 50,
+                });
+            }
+            "c" | "custom" => {
+                let thinking = ask_thinking("thinking mode", ThinkingArg::Summary)?;
+                let timeout = ask_optional_u64("timeout minutes (blank = none)", None)?;
+                let chunk_size = ask("chunk size", "25")?
+                    .trim()
+                    .parse::<usize>()
+                    .unwrap_or(25);
+                return Ok(AnalyzePreset {
+                    thinking,
+                    timeout_minutes: timeout,
+                    chunk_size,
+                });
+            }
+            _ => println!("invalid preset. use: q | b | d | c"),
+        }
+    }
+}
+
+fn ask_optional_u64(label: &str, default: Option<u64>) -> Result<Option<u64>> {
+    let default_display = default.map(|n| n.to_string()).unwrap_or_default();
+    loop {
+        let value = ask(label, &default_display)?;
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        match trimmed.parse::<u64>() {
+            Ok(parsed) => return Ok(Some(parsed)),
+            Err(_) => println!("invalid number"),
         }
     }
 }
