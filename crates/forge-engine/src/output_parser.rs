@@ -9,7 +9,7 @@ impl OutputParser {
         let lowercase = text.to_ascii_lowercase();
 
         let mut completion_count = count_completion_indicators(&text, indicators);
-        let exit_signal_true = has_explicit_exit_signal_true(&text);
+        let mut exit_signal_true = has_explicit_exit_signal_true(&text);
         let has_error = detect_error(&lowercase);
         let has_progress_hint = detect_progress_hint(&lowercase);
 
@@ -18,6 +18,9 @@ impl OutputParser {
             if let Ok(value) = serde_json::from_str::<Value>(line) {
                 if session_id.is_none() {
                     session_id = extract_session_id(&value);
+                }
+                if !exit_signal_true {
+                    exit_signal_true = json_has_explicit_exit_signal_true(&value);
                 }
                 if completion_count == 0 {
                     completion_count = count_json_indicators(&value, indicators);
@@ -50,6 +53,18 @@ fn has_explicit_exit_signal_true(text: &str) -> bool {
     text.lines()
         .map(|line| line.trim())
         .any(|line| line.eq_ignore_ascii_case("EXIT_SIGNAL: true"))
+}
+
+fn json_has_explicit_exit_signal_true(value: &Value) -> bool {
+    match value {
+        Value::String(s) => s
+            .lines()
+            .map(|line| line.trim())
+            .any(|line| line.eq_ignore_ascii_case("EXIT_SIGNAL: true")),
+        Value::Array(arr) => arr.iter().any(json_has_explicit_exit_signal_true),
+        Value::Object(map) => map.values().any(json_has_explicit_exit_signal_true),
+        _ => false,
+    }
 }
 
 fn detect_error(lowercase: &str) -> bool {
@@ -134,6 +149,20 @@ mod tests {
             "",
             &["STATUS: COMPLETE".to_string()],
         );
+        assert!(!analysis.exit_signal_true);
+    }
+
+    #[test]
+    fn detects_exit_signal_in_json_string_field() {
+        let json = r#"{"message":"work done\nEXIT_SIGNAL: true"}"#;
+        let analysis = OutputParser::parse(json, "", &[]);
+        assert!(analysis.exit_signal_true);
+    }
+
+    #[test]
+    fn does_not_treat_json_prose_mentions_as_exit_signal() {
+        let json = r#"{"message":"Do not emit EXIT_SIGNAL: true until finished"}"#;
+        let analysis = OutputParser::parse(json, "", &[]);
         assert!(!analysis.exit_signal_true);
     }
 
