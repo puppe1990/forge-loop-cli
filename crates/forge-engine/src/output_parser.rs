@@ -41,7 +41,7 @@ fn count_completion_indicators(text: &str, indicators: &[String]) -> u32 {
         .iter()
         .filter(|item| {
             let needle = item.trim();
-            lines.iter().any(|line| *line == needle)
+            lines.contains(&needle)
         })
         .count() as u32
 }
@@ -90,8 +90,7 @@ fn json_contains_indicator(value: &Value, needle: &str) -> bool {
     match value {
         Value::String(s) => {
             let target = needle.trim();
-            s.lines().map(|line| line.trim()).any(|line| line == target)
-                || s.trim() == target
+            s.lines().map(|line| line.trim()).any(|line| line == target) || s.trim() == target
         }
         Value::Array(arr) => arr.iter().any(|v| json_contains_indicator(v, needle)),
         Value::Object(map) => map.values().any(|v| json_contains_indicator(v, needle)),
