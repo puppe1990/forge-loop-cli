@@ -700,7 +700,8 @@ fn is_cli_help_noise(line: &str) -> bool {
         || normalized == "Options:"
         || normalized.contains("--help        show help")
         || normalized.contains("--version     show version number")
-        || normalized.contains("--format      format: default (formatted) or json (raw JSON events)")
+        || normalized
+            .contains("--format      format: default (formatted) or json (raw JSON events)")
 }
 
 fn split_log_timestamp(line: &str) -> (Option<String>, String) {
@@ -864,7 +865,10 @@ fn parse_activity_event(value: &Value) -> Option<ParsedActivity> {
                 };
                 return Some(ParsedActivity {
                     kind,
-                    text: format!("tool ({status}): {}", title.chars().take(180).collect::<String>()),
+                    text: format!(
+                        "tool ({status}): {}",
+                        title.chars().take(180).collect::<String>()
+                    ),
                 });
             }
             _ => {}
@@ -916,21 +920,32 @@ fn summarize_tool_detail(part: &Value, tool: &str) -> Option<String> {
                 .get("command")
                 .and_then(Value::as_str)
                 .or_else(|| input.get("cmd").and_then(Value::as_str))?;
-            Some(format!("{}: {}", tool, command.chars().take(120).collect::<String>()))
+            Some(format!(
+                "{}: {}",
+                tool,
+                command.chars().take(120).collect::<String>()
+            ))
         }
         "read" => {
             let file_path = input
                 .get("filePath")
                 .or_else(|| input.get("path"))
                 .and_then(Value::as_str)?;
-            Some(format!("read: {}", file_path.chars().take(120).collect::<String>()))
+            Some(format!(
+                "read: {}",
+                file_path.chars().take(120).collect::<String>()
+            ))
         }
         "write" | "edit" => {
             let file_path = input
                 .get("filePath")
                 .or_else(|| input.get("path"))
                 .and_then(Value::as_str)?;
-            Some(format!("{}: {}", tool, file_path.chars().take(120).collect::<String>()))
+            Some(format!(
+                "{}: {}",
+                tool,
+                file_path.chars().take(120).collect::<String>()
+            ))
         }
         _ => None,
     }
@@ -1297,7 +1312,9 @@ plain text line
 "#;
         let recent = extract_recent_activity_lines(raw, 5);
         assert!(!recent.is_empty());
-        assert!(recent.iter().any(|line| line.text.contains("plain text line")));
+        assert!(recent
+            .iter()
+            .any(|line| line.text.contains("plain text line")));
     }
 
     #[test]
@@ -1307,7 +1324,9 @@ plain text line
 [14:00:01] {"type":"tool_use","part":{"tool":"bash","state":{"status":"completed","title":"Run build"}}}
 "#;
         let recent = extract_recent_activity_lines(raw, 5);
-        assert!(recent.iter().any(|line| line.text.contains("Working on it")));
+        assert!(recent
+            .iter()
+            .any(|line| line.text.contains("Working on it")));
         assert!(recent.iter().any(|line| line.text.contains("Run build")));
     }
 
@@ -1344,7 +1363,9 @@ plain text line
 "#;
         let scoped = scope_live_log_to_active_run(raw, "opencode");
         let recent = extract_recent_activity_lines(&scoped, 5);
-        assert!(!recent.iter().any(|line| line.text.contains("codex exec failed")));
+        assert!(!recent
+            .iter()
+            .any(|line| line.text.contains("codex exec failed")));
         assert!(recent.iter().any(|line| line.text.contains("bash: ls -la")));
     }
 

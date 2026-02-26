@@ -167,24 +167,6 @@ pub fn run_loop(req: RunRequest) -> Result<RunOutcome> {
         let has_progress =
             analysis.has_progress_hint || (result.exit_ok && (!result.stdout.trim().is_empty()));
 
-        // Early completion check before mutating circuit state
-        let completed_condition_early = analysis.exit_signal_true
-            && (analysis.completion_indicators > 0
-                || result
-                    .stdout
-                    .to_ascii_lowercase()
-                    .contains("status: complete")
-                || result.stdout.to_ascii_lowercase().contains("task_complete"));
-        if completed_condition_early {
-            finalize_run_status(&mut status, "completed");
-            write_json(&runtime_dir.join("status.json"), &status)?;
-            return Ok(RunOutcome {
-                reason: ExitReason::Completed,
-                loops_executed: loop_count,
-                status,
-            });
-        }
-
         let circuit_action = if has_progress {
             circuit.record_progress()
         } else {
@@ -231,11 +213,7 @@ pub fn run_loop(req: RunRequest) -> Result<RunOutcome> {
         // or when the engine outputs a clear completion marker like "STATUS: COMPLETE".
         let completed_condition = analysis.exit_signal_true
             && (analysis.completion_indicators > 0
-                || result
-                    .stdout
-                    .to_ascii_lowercase()
-                    .contains("status: complete")
-                || result.stdout.to_ascii_lowercase().contains("task_complete"));
+                || has_explicit_completion_marker(&result.stdout));
         if completed_condition {
             finalize_run_status(&mut status, "completed");
             write_json(&runtime_dir.join("status.json"), &status)?;
@@ -264,6 +242,12 @@ pub fn run_loop(req: RunRequest) -> Result<RunOutcome> {
         reason: ExitReason::MaxLoopsReached,
         loops_executed: loop_count,
         status,
+    })
+}
+
+fn has_explicit_completion_marker(stdout: &str) -> bool {
+    stdout.lines().map(|line| line.trim()).any(|line| {
+        line.eq_ignore_ascii_case("STATUS: COMPLETE") || line.eq_ignore_ascii_case("TASK_COMPLETE")
     })
 }
 
@@ -342,5 +326,13 @@ mod tests {
         assert_eq!(status.current_loop, 0);
         assert_eq!(status.current_loop_started_at_epoch, 0);
         assert_eq!(status.last_heartbeat_at_epoch, 0);
+    }
+
+    #[test]
+    fn explicit_completion_marker_requires_standalone_line() {
+        assert!(has_explicit_completion_marker("STATUS: COMPLETE\n"));
+        assert!(!has_explicit_completion_marker(
+            "Do not emit `STATUS: COMPLETE` until finished"
+        ));
     }
 }

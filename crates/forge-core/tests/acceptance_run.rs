@@ -36,6 +36,10 @@ fn run_completes_when_dual_gate_is_satisfied() {
 
     assert_eq!(outcome.reason, ExitReason::Completed);
     assert_eq!(outcome.status.state, "completed");
+    assert_eq!(outcome.status.total_loops_executed, 1);
+    assert!(outcome.status.exit_signal_seen);
+    assert!(outcome.status.completion_indicators >= 1);
+    assert_eq!(outcome.status.current_loop, 0);
 }
 
 #[cfg(unix)]

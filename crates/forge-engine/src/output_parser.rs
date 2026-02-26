@@ -9,7 +9,7 @@ impl OutputParser {
         let lowercase = text.to_ascii_lowercase();
 
         let mut completion_count = count_completion_indicators(&text, indicators);
-        let exit_signal_true = lowercase.contains("exit_signal: true");
+        let mut exit_signal_true = has_explicit_exit_signal_true(&text);
         let has_error = detect_error(&lowercase);
         let has_progress_hint = detect_progress_hint(&lowercase);
 
@@ -18,6 +18,9 @@ impl OutputParser {
             if let Ok(value) = serde_json::from_str::<Value>(line) {
                 if session_id.is_none() {
                     session_id = extract_session_id(&value);
+                }
+                if !exit_signal_true {
+                    exit_signal_true = json_has_explicit_exit_signal_true(&value);
                 }
                 if completion_count == 0 {
                     completion_count = count_json_indicators(&value, indicators);
@@ -36,10 +39,32 @@ impl OutputParser {
 }
 
 fn count_completion_indicators(text: &str, indicators: &[String]) -> u32 {
+    let lines = text.lines().map(|line| line.trim()).collect::<Vec<_>>();
     indicators
         .iter()
-        .filter(|item| text.contains(*item))
+        .filter(|item| {
+            let needle = item.trim();
+            lines.contains(&needle)
+        })
         .count() as u32
+}
+
+fn has_explicit_exit_signal_true(text: &str) -> bool {
+    text.lines()
+        .map(|line| line.trim())
+        .any(|line| line.eq_ignore_ascii_case("EXIT_SIGNAL: true"))
+}
+
+fn json_has_explicit_exit_signal_true(value: &Value) -> bool {
+    match value {
+        Value::String(s) => s
+            .lines()
+            .map(|line| line.trim())
+            .any(|line| line.eq_ignore_ascii_case("EXIT_SIGNAL: true")),
+        Value::Array(arr) => arr.iter().any(json_has_explicit_exit_signal_true),
+        Value::Object(map) => map.values().any(json_has_explicit_exit_signal_true),
+        _ => false,
+    }
 }
 
 fn detect_error(lowercase: &str) -> bool {
@@ -57,7 +82,7 @@ fn detect_progress_hint(lowercase: &str) -> bool {
 fn count_json_indicators(value: &Value, indicators: &[String]) -> u32 {
     indicators
         .iter()
-        .filter(|needle| json_contains_string(value, needle))
+        .filter(|needle| json_contains_indicator(value, needle))
         .count() as u32
 }
 
@@ -76,11 +101,14 @@ fn extract_session_id(value: &Value) -> Option<String> {
     }
 }
 
-fn json_contains_string(value: &Value, needle: &str) -> bool {
+fn json_contains_indicator(value: &Value, needle: &str) -> bool {
     match value {
-        Value::String(s) => s.contains(needle),
-        Value::Array(arr) => arr.iter().any(|v| json_contains_string(v, needle)),
-        Value::Object(map) => map.values().any(|v| json_contains_string(v, needle)),
+        Value::String(s) => {
+            let target = needle.trim();
+            s.lines().map(|line| line.trim()).any(|line| line == target) || s.trim() == target
+        }
+        Value::Array(arr) => arr.iter().any(|v| json_contains_indicator(v, needle)),
+        Value::Object(map) => map.values().any(|v| json_contains_indicator(v, needle)),
         _ => false,
     }
 }
@@ -112,6 +140,41 @@ mod tests {
         let indicators = vec!["STATUS: COMPLETE".to_string(), "TASK_COMPLETE".to_string()];
         let analysis = OutputParser::parse("STATUS: COMPLETE\nTASK_COMPLETE", "", &indicators);
         assert_eq!(analysis.completion_indicators, 2);
+    }
+
+    #[test]
+    fn does_not_treat_prose_mentions_as_exit_signal() {
+        let analysis = OutputParser::parse(
+            "I am not emitting `EXIT_SIGNAL: true` yet.",
+            "",
+            &["STATUS: COMPLETE".to_string()],
+        );
+        assert!(!analysis.exit_signal_true);
+    }
+
+    #[test]
+    fn detects_exit_signal_in_json_string_field() {
+        let json = r#"{"message":"work done\nEXIT_SIGNAL: true"}"#;
+        let analysis = OutputParser::parse(json, "", &[]);
+        assert!(analysis.exit_signal_true);
+    }
+
+    #[test]
+    fn does_not_treat_json_prose_mentions_as_exit_signal() {
+        let json = r#"{"message":"Do not emit EXIT_SIGNAL: true until finished"}"#;
+        let analysis = OutputParser::parse(json, "", &[]);
+        assert!(!analysis.exit_signal_true);
+    }
+
+    #[test]
+    fn does_not_treat_prose_mentions_as_completion_indicator() {
+        let indicators = vec!["STATUS: COMPLETE".to_string()];
+        let analysis = OutputParser::parse(
+            "Do not emit `STATUS: COMPLETE` until all tasks are done.",
+            "",
+            &indicators,
+        );
+        assert_eq!(analysis.completion_indicators, 0);
     }
 
     #[test]
@@ -182,6 +245,14 @@ mod tests {
         let json = r#"{"status": "COMPLETE", "result": {"state": "COMPLETE"}}"#;
         let analysis = OutputParser::parse(json, "", &indicators);
         assert_eq!(analysis.completion_indicators, 1);
+    }
+
+    #[test]
+    fn does_not_count_json_prose_mentions_as_indicator() {
+        let indicators = vec!["STATUS: COMPLETE".to_string()];
+        let json = r#"{"message":"Do not emit STATUS: COMPLETE until done"}"#;
+        let analysis = OutputParser::parse(json, "", &indicators);
+        assert_eq!(analysis.completion_indicators, 0);
     }
 
     #[test]
